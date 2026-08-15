@@ -29,6 +29,20 @@ XD_LABELS = {
     "B6": "car accident",
     "G": "explosion",
 }
+UCF_TRAIN_LABELS = {
+    "Normal": "normal", "Abuse": "abuse", "Arrest": "arrest", "Arson": "arson",
+    "Assault": "assault", "Burglary": "burglary", "Explosion": "explosion",
+    "Fighting": "fighting", "RoadAccidents": "roadAccidents", "Robbery": "robbery",
+    "Shooting": "shooting", "Shoplifting": "shoplifting", "Stealing": "stealing",
+    "Vandalism": "vandalism",
+}
+UCF_TEST_LABELS = {
+    "Normal": "Normal", "Abuse": "Abuse", "Arrest": "Arrest", "Arson": "Arson",
+    "Assault": "Assault", "Burglary": "Burglary", "Explosion": "Explosion",
+    "Fighting": "Fighting", "RoadAccidents": "RoadAccidents", "Robbery": "Robbery",
+    "Shooting": "Shooting", "Shoplifting": "Shoplifting", "Stealing": "Stealing",
+    "Vandalism": "Vandalism",
+}
 CHUNK_SUFFIX = re.compile(r"__(\d+)$")
 
 
@@ -154,6 +168,26 @@ def chunk_index(path_or_key: str) -> int:
 def is_pure_normal_xd(label: str) -> bool:
     """Only official XD label A is admitted as a negative source."""
     return str(label).strip() == "A"
+
+
+def normal_label(dataset: str) -> str:
+    if dataset == "xd":
+        return "A"
+    if dataset == "ucf":
+        return "Normal"
+    raise ValueError(f"unsupported dataset={dataset!r}")
+
+
+def is_pure_normal(dataset: str, label: str) -> bool:
+    return str(label).strip() == normal_label(dataset)
+
+
+def labels_for_dataset(dataset: str, test: bool = False) -> dict[str, str]:
+    if dataset == "xd":
+        return XD_LABELS
+    if dataset == "ucf":
+        return UCF_TEST_LABELS if test else UCF_TRAIN_LABELS
+    raise ValueError(f"unsupported dataset={dataset!r}")
 
 
 def grouped_rows(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:

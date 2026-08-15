@@ -68,6 +68,7 @@ def fuse_feature(hidden: np.ndarray, clip: np.ndarray, mean: np.ndarray, std: np
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build resumable XD [DNA neuron|CLIP] features for the local VadCLIP wrapper.")
+    parser.add_argument("--dataset", choices=["xd", "ucf"], default="xd")
     parser.add_argument("--split", choices=["train", "test"], required=True)
     parser.add_argument("--source-csv", required=True, help="Original/reused XD 512D path,label CSV for this split.")
     parser.add_argument(
@@ -95,7 +96,7 @@ def main() -> None:
         shutil.rmtree(split_dir)
     split_dir.mkdir(parents=True, exist_ok=True)
     lists_dir = stage_dir(args.output_root, "lists")
-    output_csv = lists_dir / f"xd_concat_{args.split}.csv"
+    output_csv = lists_dir / f"{args.dataset}_concat_{args.split}.csv"
     if args.clean and output_csv.exists():
         output_csv.unlink()
     neuron_json = Path(args.neuron_json).resolve() if args.neuron_json else (root.parent / "localization" / "selected_neurons.json").resolve()
@@ -152,7 +153,7 @@ def main() -> None:
     write_csv(split_dir / "alignment.csv", ["source_path", "video_key", "clip_length", "neuron_width", "fused_width", "alignment"], alignment_rows)
     write_csv(split_dir / "skipped_rows.csv", ["source_path", "label", "video_key", "reason"], skipped)
     save_json(split_dir / "summary.json", {
-        "split": args.split, "source_csv": args.source_csv, "source_path_base": args.source_path_base,
+        "dataset": args.dataset, "split": args.split, "source_csv": args.source_csv, "source_path_base": args.source_path_base,
         "hidden_manifest": args.hidden_manifest,
         "neuron_json": relpath(neuron_json, split_dir), "token_pool": token_pool,
         "alignment": args.alignment, "allow_missing_hidden": args.allow_missing_hidden,

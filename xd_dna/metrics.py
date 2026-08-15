@@ -8,7 +8,7 @@ import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
 from tqdm import tqdm
 
-from .common import XD_LABELS
+from .common import XD_LABELS, labels_for_dataset
 from .vadclip import add_local_vadclip_source
 
 
@@ -72,9 +72,15 @@ def metrics_from_predictions(
     gt: np.ndarray,
     gtsegments: np.ndarray,
     gtlabels: np.ndarray,
+    dataset: str = "xd",
 ) -> XDMetrics:
     add_local_vadclip_source()
-    from utils.xd_detectionMAP import getDetectionMAP
+    if dataset == "xd":
+        from utils.xd_detectionMAP import getDetectionMAP
+    elif dataset == "ucf":
+        from utils.ucf_detectionMAP import getDetectionMAP
+    else:
+        raise ValueError(f"unsupported dataset={dataset!r}")
 
     prob1 = np.concatenate(probabilities1, axis=0)
     prob2 = np.concatenate(probabilities2, axis=0)
@@ -93,9 +99,20 @@ def metrics_from_predictions(
     )
 
 
-def evaluate_loader(model, loader, maxlen: int, gt: np.ndarray, gtsegments: np.ndarray, gtlabels: np.ndarray, device: torch.device, progress: str) -> XDMetrics:
+def evaluate_loader(
+    model,
+    loader,
+    maxlen: int,
+    gt: np.ndarray,
+    gtsegments: np.ndarray,
+    gtlabels: np.ndarray,
+    device: torch.device,
+    progress: str,
+    dataset: str = "xd",
+    prompt_text: list[str] | None = None,
+) -> XDMetrics:
     model.to(device).eval()
-    prompt_text = list(XD_LABELS.values())
+    prompt_text = prompt_text or list(labels_for_dataset(dataset, test=(dataset == "ucf")).values())
     probabilities1: list[np.ndarray] = []
     probabilities2: list[np.ndarray] = []
     logits2_probability: list[np.ndarray] = []
@@ -104,4 +121,4 @@ def evaluate_loader(model, loader, maxlen: int, gt: np.ndarray, gtsegments: np.n
         probabilities1.append(prob1)
         probabilities2.append(prob2)
         logits2_probability.append(logits2)
-    return metrics_from_predictions(probabilities1, probabilities2, logits2_probability, gt, gtsegments, gtlabels)
+    return metrics_from_predictions(probabilities1, probabilities2, logits2_probability, gt, gtsegments, gtlabels, dataset)

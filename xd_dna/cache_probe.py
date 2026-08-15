@@ -49,6 +49,7 @@ def read_shard(path: Path) -> dict[str, np.ndarray] | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create resumable [N,12,768] DNA probe cache from hidden artifacts.")
+    parser.add_argument("--dataset", choices=["xd", "ucf"], default="xd")
     parser.add_argument("--samples-csv", default="", help="Defaults to samples/samples.csv under --output-root.")
     parser.add_argument("--output-root", default=str(default_output_root()))
     parser.add_argument("--videos-per-shard", type=int, default=25)
@@ -65,8 +66,9 @@ def main() -> None:
     if missing:
         raise ValueError(f"{samples_csv}: missing probe sample columns {sorted(missing)}")
     negatives = samples[samples["target"].astype(int) == 0]
-    if set(negatives["source_label"].astype(str)) != {"A"} or set(negatives["source_role"].astype(str)) != {"pure_normal_video"}:
-        raise ValueError(f"{samples_csv}: all target=0 rows must come from A-labelled pure normal videos")
+    expected_normal = "A" if args.dataset == "xd" else "Normal"
+    if set(negatives["source_label"].astype(str)) != {expected_normal} or set(negatives["source_role"].astype(str)) != {"pure_normal_video"}:
+        raise ValueError(f"{samples_csv}: all target=0 rows must come from {expected_normal}-labelled pure normal videos")
     samples = samples.sort_values("sample_id", kind="mergesort").reset_index(drop=True)
     if not np.array_equal(samples["sample_id"].to_numpy(), np.arange(len(samples))):
         raise ValueError(f"{samples_csv}: sample_id must be contiguous from zero")
@@ -124,7 +126,7 @@ def main() -> None:
     layers = np.arange(1, merged["hidden"].shape[1] + 1, dtype=np.int16)
     atomic_save_npz(output / "probe_cache.npz", layers=layers, **merged)
     save_json(output / "summary.json", {
-        "samples_csv": str(samples_csv),
+        "dataset": args.dataset, "samples_csv": str(samples_csv),
         "samples": int(len(samples)), "videos": len(video_keys), "shards": len(shard_paths),
         "hidden_shape": list(merged["hidden"].shape), "layers": layers.tolist(),
         "resume_contract": "sample_id exact match plus finite [N,L,D] shard tensors",

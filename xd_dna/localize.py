@@ -72,6 +72,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Localize DNA neurons with pure-normal negatives and top-k per CLIP layer selection."
     )
+    parser.add_argument("--dataset", choices=["xd", "ucf"], default="xd")
     parser.add_argument("--cache", default="", help="Defaults to cache/probe_cache.npz under --output-root.")
     parser.add_argument("--output-root", default=str(default_output_root()))
     parser.add_argument("--device", default="cuda")
@@ -180,8 +181,8 @@ def main() -> None:
     save_json(selected_json, {
         "method": "dsanet_dna_triadic_probe_vadclip_xd_normal_negative",
         "description": "Per-layer linear probes use abnormal high VadCLIP pseudo-score snippets as positives and A-labelled pure-normal-video snippets as negatives. A neuron score is |mean activation × mean gradient × probe weight|.",
-        "dataset": "xd", "clip_model": "ViT-B/16", "token_pool": "cls",
-        "negative_source": "pure_normal_video_only", "negative_label": "A",
+        "dataset": args.dataset, "clip_model": "ViT-B/16", "token_pool": "cls",
+        "negative_source": "pure_normal_video_only", "negative_label": "A" if args.dataset == "xd" else "Normal",
         "selection_mode": "topk_per_layer", "topk_per_layer": args.topk_per_layer,
         "num_layers": len(layers), "hidden_dim": int(hidden.shape[2]), "neuron_width": selected_width,
         "clip_dim": 512, "input_width": selected_width + 512,

@@ -11,12 +11,26 @@ from .vadclip import add_local_vadclip_source
 
 
 class XDDNAFeatureDataset(data.Dataset):
-    def __init__(self, csv_path: str, visual_length: int, input_width: int, test_mode: bool) -> None:
+    def __init__(
+        self,
+        csv_path: str,
+        visual_length: int,
+        input_width: int,
+        test_mode: bool,
+        normal: bool | None = None,
+        normal_label: str = "Normal",
+    ) -> None:
         self.csv_path = Path(csv_path).resolve()
         self.frame = read_path_label_csv(self.csv_path)
         self.visual_length = int(visual_length)
         self.input_width = int(input_width)
         self.test_mode = bool(test_mode)
+        if not self.test_mode and normal is not None:
+            is_normal = self.frame["label"].astype(str) == str(normal_label)
+            self.frame = self.frame.loc[is_normal if normal else ~is_normal].reset_index(drop=True)
+            if self.frame.empty:
+                role = "normal" if normal else "anomalous"
+                raise ValueError(f"{self.csv_path}: no {role} training rows")
         add_local_vadclip_source()
         from utils.tools import process_feat, process_split
 

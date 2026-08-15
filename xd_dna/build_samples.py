@@ -13,7 +13,7 @@ from .common import (
     default_output_root,
     deterministic_split,
     grouped_rows,
-    is_pure_normal_xd,
+    is_pure_normal,
     load_hidden,
     manifest_hidden_paths,
     read_path_label_csv,
@@ -80,6 +80,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create train/validation probe samples with pure-normal XD negatives."
     )
+    parser.add_argument("--dataset", choices=["xd", "ucf"], default="xd")
     parser.add_argument("--source-train-csv", required=True, help="Reusable XD 512D train CSV with path,label columns.")
     parser.add_argument("--hidden-manifest", required=True, help="Reusable [T,12,768] CLS hidden manifest.")
     parser.add_argument(
@@ -123,7 +124,7 @@ def main() -> None:
         label = str(group.iloc[0]["label"])
         if key not in hidden_by_key:
             skipped.append([key, label, "missing_hidden"])
-        elif is_pure_normal_xd(label):
+        elif is_pure_normal(args.dataset, label):
             normals.append(key)
         elif key not in pseudo_by_key:
             skipped.append([key, label, "missing_pseudo_score"])
@@ -163,7 +164,7 @@ def main() -> None:
         for key, time_index in normal_rows(eligible_normals, hidden_by_key, positives, rng):
             sample_rows.append({
                 "split": split, "target": 0, "video_key": key,
-                "source_label": "A", "source_role": "pure_normal_video",
+                "source_label": "A" if args.dataset == "xd" else "Normal", "source_role": "pure_normal_video",
                 "hidden_path": relpath(hidden_by_key[key], output), "time_index": int(time_index),
                 "baseline_score": "",
             })
@@ -176,17 +177,18 @@ def main() -> None:
         if counts.get(0, 0) != counts.get(1, 0) or counts.get(0, 0) == 0:
             raise RuntimeError(f"{split}: expected balanced positive/pure-normal negative samples, got {counts}")
         negative_labels = set(frame.loc[(frame["split"] == split) & (frame["target"] == 0), "source_label"])
-        if negative_labels != {"A"}:
-            raise RuntimeError(f"{split}: negative samples are not exclusively pure normal A videos: {negative_labels}")
+        expected_normal = "A" if args.dataset == "xd" else "Normal"
+        if negative_labels != {expected_normal}:
+            raise RuntimeError(f"{split}: negative samples are not exclusively pure normal {expected_normal} videos: {negative_labels}")
     frame = frame.sort_values(["split", "target", "video_key", "time_index"], kind="mergesort").reset_index(drop=True)
     frame.insert(0, "sample_id", np.arange(len(frame), dtype=np.int64))
     write_csv(target, frame.columns.tolist(), frame.itertuples(index=False, name=None))
     write_csv(output / "skipped_videos.csv", ["video_key", "label", "reason"], skipped)
     save_json(output / "summary.json", {
-        "dataset": "xd",
+        "dataset": args.dataset,
         "token_pool": token_pool,
         "negative_source": "pure_normal_video_only",
-        "negative_label": "A",
+        "negative_label": "A" if args.dataset == "xd" else "Normal",
         "positive_source": "highest_frozen_vadclip_logits1_scores_from_abnormal_videos",
         "validation_fraction": args.validation_fraction,
         "top_p": args.top_p,

@@ -1,6 +1,6 @@
-# XD DNA on VadCLIP
+# DNA on VadCLIP（XD-Violence / UCF-Crime）
 
-这套代码将 `DSANet_DNA` 的“冻结 CLIP 中间层 + 线性探针 + 激活×梯度×权重”神经元定位迁到本目录的未修改 `VadCLIP` baseline。仅覆盖 XD-Violence。
+这套代码将 `DSANet_DNA` 的“冻结 CLIP 中间层 + 线性探针 + 激活×梯度×权重”神经元定位迁到本目录的未修改 `VadCLIP` baseline，覆盖 XD-Violence 与 UCF-Crime。
 
 方法约定：异常视频的 VadCLIP `logits1` 高分片段为伪正样本；负样本严格只来自标签为 `A` 的纯正常视频。12 个 ViT-B/16 CLS 层分别按 triadic 分数选 `--topk-per-layer` 个神经元，默认每层 64 个，即 768D。其 z-score 特征与同时间步官方 512D CLIP 特征拼为 1280D，经过新建的残差支路后再喂给原始 512D VadCLIP。`VadCLIP/` 内没有任何修改。
 
@@ -22,7 +22,7 @@ CLIP 实现相同：`VadCLIP/src/clip/model.py`、`vad_code/DSANet/src/clip/mode
 
 不可复用：DSANet checkpoint、DSANet 伪分数、旧选中神经元、旧派生特征、DSANet 训练权重。新的伪分数由 VadCLIP XD 512D checkpoint 生成。
 
-所有新产物都在同级 `../vadclipDNA_data/xd_normal_negative_top64/`。重复运行默认验证并复用单视频/单分片产物；某阶段需要从头重做时只给该命令加 `--clean`。训练中断后给同一训练命令加 `--resume`。测试逐视频预测会自动续跑。
+XD 的所有新产物都在同级 `../vadclipDNA_data/xd_normal_negative_top64/`；UCF 的对应根目录见后文。重复运行默认验证并复用单视频/单分片产物；某阶段需要从头重做时只给该命令加 `--clean`。训练中断后给同一训练命令加 `--resume`。测试逐视频预测会自动续跑。
 
 ## XD 正式命令
 
@@ -145,3 +145,116 @@ python -m xd_dna.test \
   evaluation/predictions/*.npz
   evaluation/metrics.json
 ```
+
+## UCF-Crime 正式命令
+
+UCF 复用的数据资产与 XD 同样是 DSANet 已导出的最终 512D CLIP 特征和 `[T,12,768]` CLS hidden：
+
+```text
+../vad_data/work_ucf/
+  ucf_train_local.csv
+  ucf_test_local.csv
+  clip_hidden_stride16_train_8gpu/manifest.csv
+  clip_hidden_stride16_test_8gpu/manifest.csv
+```
+
+以下命令从 `vadclipDNA_code` 运行，产物写入 `../vadclipDNA_data/ucf_normal_negative_top64/`。UCF 的纯正常负样本标签是 `Normal`，其他逻辑与 XD 一致。
+
+```bash
+python -m xd_dna.score_pseudo \
+  --dataset ucf \
+  --source-train-csv ../vad_data/work_ucf/ucf_train_local.csv \
+  --source-path-base . \
+  --baseline-model ../vadclip_data/model/vadclip_ucf.pth \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --device cuda
+
+python -m xd_dna.build_samples \
+  --dataset ucf \
+  --source-train-csv ../vad_data/work_ucf/ucf_train_local.csv \
+  --hidden-manifest ../vad_data/work_ucf/clip_hidden_stride16_train_8gpu/manifest.csv \
+  --hidden-path-base . \
+  --pseudo-csv ../vadclipDNA_data/ucf_normal_negative_top64/pseudo_scores/group_scores.csv \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --validation-fraction 0.20 \
+  --top-p 0.10 \
+  --min-positive-per-video 3 \
+  --max-positive-per-video 32 \
+  --seed 234
+
+python -m xd_dna.cache_probe \
+  --dataset ucf \
+  --samples-csv ../vadclipDNA_data/ucf_normal_negative_top64/samples/samples.csv \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --videos-per-shard 25
+
+python -m xd_dna.localize \
+  --dataset ucf \
+  --cache ../vadclipDNA_data/ucf_normal_negative_top64/cache/probe_cache.npz \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --device cuda \
+  --probe-epochs 100 \
+  --probe-lr 1e-2 \
+  --probe-weight-decay 1e-4 \
+  --topk-per-layer 64 \
+  --seed 234
+
+python -m xd_dna.build_features \
+  --dataset ucf \
+  --split train \
+  --source-csv ../vad_data/work_ucf/ucf_train_local.csv \
+  --source-path-base . \
+  --hidden-manifest ../vad_data/work_ucf/clip_hidden_stride16_train_8gpu/manifest.csv \
+  --hidden-path-base . \
+  --neuron-json ../vadclipDNA_data/ucf_normal_negative_top64/localization/selected_neurons.json \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --alignment crop_hidden
+
+python -m xd_dna.build_features \
+  --dataset ucf \
+  --split test \
+  --source-csv ../vad_data/work_ucf/ucf_test_local.csv \
+  --source-path-base . \
+  --hidden-manifest ../vad_data/work_ucf/clip_hidden_stride16_test_8gpu/manifest.csv \
+  --hidden-path-base . \
+  --neuron-json ../vadclipDNA_data/ucf_normal_negative_top64/localization/selected_neurons.json \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --alignment crop_hidden
+
+python -m xd_dna.train_ucf \
+  --train-list ../vadclipDNA_data/ucf_normal_negative_top64/lists/ucf_concat_train.csv \
+  --test-list ../vadclipDNA_data/ucf_normal_negative_top64/lists/ucf_concat_test.csv \
+  --neuron-json ../vadclipDNA_data/ucf_normal_negative_top64/localization/selected_neurons.json \
+  --init-baseline-model ../vadclip_data/model/vadclip_ucf.pth \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --gt-path VadCLIP/list/gt_ucf.npy \
+  --gt-segment-path VadCLIP/list/gt_segment_ucf.npy \
+  --gt-label-path VadCLIP/list/gt_label_ucf.npy \
+  --max-epoch 10 \
+  --batch-size 64 \
+  --lr 2e-5 \
+  --scheduler-milestones 4 8 \
+  --scheduler-rate 0.1 \
+  --eval-interval-samples 1280 \
+  --num-workers 0 \
+  --residual-hidden-dim 1024 \
+  --residual-depth 3 \
+  --seed 234 \
+  --device cuda
+
+python -m xd_dna.test_ucf \
+  --test-list ../vadclipDNA_data/ucf_normal_negative_top64/lists/ucf_concat_test.csv \
+  --neuron-json ../vadclipDNA_data/ucf_normal_negative_top64/localization/selected_neurons.json \
+  --model-path ../vadclipDNA_data/ucf_normal_negative_top64/training/model_best.pth \
+  --init-baseline-model ../vadclip_data/model/vadclip_ucf.pth \
+  --output-root ../vadclipDNA_data/ucf_normal_negative_top64 \
+  --gt-path VadCLIP/list/gt_ucf.npy \
+  --gt-segment-path VadCLIP/list/gt_segment_ucf.npy \
+  --gt-label-path VadCLIP/list/gt_label_ucf.npy \
+  --num-workers 0 \
+  --residual-hidden-dim 1024 \
+  --residual-depth 3 \
+  --device cuda
+```
+
+UCF 的训练与 XD 不同：每一步拼接等量 `Normal` 和异常 batch，使用 `batch-size=64`、`lr=2e-5`、`MultiStepLR(4,8)`；严格复现官方 `ucf_train.py` 的保存规则，按分类分支 `AUC1` 保存 `training/model_best.pth`。最终 `test_ucf` 仍输出官方 `AUC1/AP1/AUC2/AP2` 和 detection mAP。

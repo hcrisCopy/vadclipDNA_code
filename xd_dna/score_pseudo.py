@@ -35,6 +35,7 @@ def valid_score(path: Path) -> np.ndarray | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Score XD training videos with frozen local VadCLIP logits1.")
+    parser.add_argument("--dataset", choices=["xd", "ucf"], default="xd")
     parser.add_argument("--source-train-csv", required=True, help="Reusable 512D XD train CSV with path,label columns.")
     parser.add_argument(
         "--source-path-base", default=".",
@@ -52,7 +53,7 @@ def main() -> None:
     root = stage_dir(args.output_root, "pseudo_scores", clean=args.clean)
     score_dir = (root / "scores").resolve()
     score_dir.mkdir(parents=True, exist_ok=True)
-    options = load_options()
+    options = load_options(args.dataset)
     if options.visual_width != 512:
         raise ValueError(f"unexpected local XD VadCLIP input width: {options.visual_width}")
     device = torch.device(args.device)
@@ -76,7 +77,7 @@ def main() -> None:
             lengths = {len(feature) for feature in variants}
             if len(lengths) != 1:
                 raise ValueError(f"{key}: 512D feature variants have inconsistent temporal lengths {sorted(lengths)}")
-            variant_scores = [score_sequence(model, feature, options.visual_length, device) for feature in variants]
+            variant_scores = [score_sequence(model, feature, options.visual_length, device, args.dataset) for feature in variants]
             scores = np.stack(variant_scores, axis=0).mean(axis=0).astype(np.float32)
             atomic_save_npy(output, scores)
         rows.append([key, str(group.iloc[0]["label"]), relpath(output, root), len(scores), len(group)])
@@ -84,6 +85,7 @@ def main() -> None:
     write_csv(root / "group_scores.csv", ["key", "label", "score_path", "score_len", "num_variants"], rows)
     save_json(root / "run_config.json", {
         "method": "frozen_vadclip_logits1_pseudo_score",
+        "dataset": args.dataset,
         "source_train_csv": args.source_train_csv,
         "source_path_base": args.source_path_base,
         "baseline_model": args.baseline_model,

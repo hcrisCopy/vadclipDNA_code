@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .common import XD_LABELS
+from .common import labels_for_dataset
 
 
 def local_vadclip_root() -> Path:
@@ -26,11 +26,16 @@ def add_local_vadclip_source() -> Path:
     return root
 
 
-def load_options():
+def load_options(dataset: str = "xd"):
     add_local_vadclip_source()
-    import xd_option
+    if dataset == "xd":
+        import xd_option as option_module
+    elif dataset == "ucf":
+        import ucf_option as option_module
+    else:
+        raise ValueError(f"unsupported dataset={dataset!r}")
 
-    return xd_option.parser.parse_args([])
+    return option_module.parser.parse_args([])
 
 
 def state_dict_from_checkpoint(path: str | Path) -> dict:
@@ -70,6 +75,7 @@ def score_sequence(
     sequence: np.ndarray,
     visual_length: int,
     device: torch.device,
+    dataset: str = "xd",
 ) -> np.ndarray:
     """Return VadCLIP sigmoid(logits1), with the official 256-step chunking."""
     if sequence.ndim != 2 or sequence.shape[1] != 512:
@@ -85,5 +91,5 @@ def score_sequence(
     visual = torch.from_numpy(np.concatenate(chunks, axis=0)).to(device)
     valid_lengths = torch.tensor(lengths, dtype=torch.int64, device=device)
     with torch.no_grad():
-        _text, logits1, _logits2 = model(visual, None, list(XD_LABELS.values()), valid_lengths)
+        _text, logits1, _logits2 = model(visual, None, list(labels_for_dataset(dataset).values()), valid_lengths)
     return torch.sigmoid(logits1.reshape(-1)[:len(sequence)]).cpu().numpy().astype(np.float32)
