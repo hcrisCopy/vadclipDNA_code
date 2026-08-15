@@ -36,6 +36,10 @@ def valid_score(path: Path) -> np.ndarray | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Score XD training videos with frozen local VadCLIP logits1.")
     parser.add_argument("--source-train-csv", required=True, help="Reusable 512D XD train CSV with path,label columns.")
+    parser.add_argument(
+        "--source-path-base", default=".",
+        help="Base directory for relative paths inside the original VadCLIP CSV; use '.' when running from vadclipDNA_code.",
+    )
     parser.add_argument("--baseline-model", required=True, help="VadCLIP XD 512D checkpoint, not a DSANet checkpoint.")
     parser.add_argument("--output-root", default=str(default_output_root()))
     parser.add_argument("--device", default="cuda")
@@ -55,13 +59,17 @@ def main() -> None:
     model = build_baseline(options, args.baseline_model, device)
 
     source_csv = Path(args.source_train_csv).resolve()
+    source_path_base = Path(args.source_path_base).resolve()
     groups = grouped_rows(read_path_label_csv(source_csv))
     rows: list[list[object]] = []
     for key, group in tqdm(groups.items(), desc="VadCLIP pseudo scores", unit="video"):
         output = score_dir / f"{key}.npy"
         scores = None if args.no_resume else valid_score(output)
         if scores is None:
-            variants = [load_clip_feature(resolve_recorded_path(str(row.path), source_csv.parent)) for row in group.itertuples(index=False)]
+            # Original VadCLIP's XDDataset calls np.load(row['path']) directly,
+            # so its relative paths are relative to the process working
+            # directory, not the CSV directory.  Keep that contract exactly.
+            variants = [load_clip_feature(resolve_recorded_path(str(row.path), source_path_base)) for row in group.itertuples(index=False)]
             for feature in variants:
                 if feature.shape[1] != options.visual_width:
                     raise ValueError(f"{key}: expected 512D final CLIP feature, got {feature.shape}")
@@ -77,6 +85,7 @@ def main() -> None:
     save_json(root / "run_config.json", {
         "method": "frozen_vadclip_logits1_pseudo_score",
         "source_train_csv": args.source_train_csv,
+        "source_path_base": args.source_path_base,
         "baseline_model": args.baseline_model,
         "score_aggregation": "mean over same-video CLIP variants",
         "visual_length": int(options.visual_length),

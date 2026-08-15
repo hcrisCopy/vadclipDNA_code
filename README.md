@@ -31,6 +31,7 @@ CLIP 实现相同：`VadCLIP/src/clip/model.py`、`vad_code/DSANet/src/clip/mode
 ```bash
 python -m xd_dna.score_pseudo \
   --source-train-csv ../vad_data/work_xd/xd_train_local.csv \
+  --source-path-base . \
   --baseline-model ../vadclip_data/model/vadclip_xd.pth \
   --output-root ../vadclipDNA_data/xd_normal_negative_top64 \
   --device cuda
@@ -68,6 +69,7 @@ python -m xd_dna.localize \
 python -m xd_dna.build_features \
   --split train \
   --source-csv ../vad_data/work_xd/xd_train_local.csv \
+  --source-path-base . \
   --hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_train_8gpu/manifest.csv \
   --neuron-json ../vadclipDNA_data/xd_normal_negative_top64/localization/selected_neurons.json \
   --output-root ../vadclipDNA_data/xd_normal_negative_top64 \
@@ -77,6 +79,7 @@ python -m xd_dna.build_features \
 python -m xd_dna.build_features \
   --split test \
   --source-csv ../vad_data/work_xd/xd_test_local.csv \
+  --source-path-base . \
   --hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_test_8gpu/manifest.csv \
   --neuron-json ../vadclipDNA_data/xd_normal_negative_top64/localization/selected_neurons.json \
   --output-root ../vadclipDNA_data/xd_normal_negative_top64 \

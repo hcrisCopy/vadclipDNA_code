@@ -70,6 +70,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build resumable XD [DNA neuron|CLIP] features for the local VadCLIP wrapper.")
     parser.add_argument("--split", choices=["train", "test"], required=True)
     parser.add_argument("--source-csv", required=True, help="Original/reused XD 512D path,label CSV for this split.")
+    parser.add_argument(
+        "--source-path-base", default=".",
+        help="Base directory for relative paths in the original VadCLIP CSV; use '.' when running from vadclipDNA_code.",
+    )
     parser.add_argument("--hidden-manifest", required=True, help="Reusable CLS hidden manifest for this split.")
     parser.add_argument("--neuron-json", default="", help="Defaults to localization/selected_neurons.json under --output-root.")
     parser.add_argument("--output-root", default=str(default_output_root()))
@@ -94,6 +98,7 @@ def main() -> None:
     contract, mean, std, selected = selected_contract(neuron_json)
     hidden_by_key, token_pool = manifest_hidden_paths(args.hidden_manifest, args.hidden_prefix_from, args.hidden_prefix_to)
     source_csv = Path(args.source_csv).resolve()
+    source_path_base = Path(args.source_path_base).resolve()
     source = read_path_label_csv(source_csv)
 
     output_rows: list[list[str]] = []
@@ -113,7 +118,9 @@ def main() -> None:
                 raise FileNotFoundError(f"{key}: no hidden artifact in {args.hidden_manifest}")
             skipped.append([source_path, label, key, "missing_hidden"])
             continue
-        clip = load_clip_feature(resolve_recorded_path(source_path, source_csv.parent))
+        # Match the unmodified VadCLIP dataset: original feature CSV paths are
+        # interpreted from the launch directory, not from the CSV's directory.
+        clip = load_clip_feature(resolve_recorded_path(source_path, source_path_base))
         reused = False
         if target.is_file() and not args.no_resume:
             candidate = load_clip_feature(target)
@@ -139,7 +146,8 @@ def main() -> None:
     write_csv(split_dir / "alignment.csv", ["source_path", "video_key", "clip_length", "neuron_width", "fused_width", "alignment"], alignment_rows)
     write_csv(split_dir / "skipped_rows.csv", ["source_path", "label", "video_key", "reason"], skipped)
     save_json(split_dir / "summary.json", {
-        "split": args.split, "source_csv": args.source_csv, "hidden_manifest": args.hidden_manifest,
+        "split": args.split, "source_csv": args.source_csv, "source_path_base": args.source_path_base,
+        "hidden_manifest": args.hidden_manifest,
         "neuron_json": relpath(neuron_json, split_dir), "token_pool": token_pool,
         "alignment": args.alignment, "allow_missing_hidden": args.allow_missing_hidden,
         "rows_written": len(output_rows), "rows_skipped": len(skipped),
