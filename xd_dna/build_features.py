@@ -75,6 +75,10 @@ def main() -> None:
         help="Base directory for relative paths in the original VadCLIP CSV; use '.' when running from vadclipDNA_code.",
     )
     parser.add_argument("--hidden-manifest", required=True, help="Reusable CLS hidden manifest for this split.")
+    parser.add_argument(
+        "--hidden-path-base", default=".",
+        help="Base directory for relative hidden_path entries in the DSANet manifest; use '.' from vadclipDNA_code.",
+    )
     parser.add_argument("--neuron-json", default="", help="Defaults to localization/selected_neurons.json under --output-root.")
     parser.add_argument("--output-root", default=str(default_output_root()))
     parser.add_argument("--hidden-prefix-from", default="")
@@ -96,7 +100,9 @@ def main() -> None:
         output_csv.unlink()
     neuron_json = Path(args.neuron_json).resolve() if args.neuron_json else (root.parent / "localization" / "selected_neurons.json").resolve()
     contract, mean, std, selected = selected_contract(neuron_json)
-    hidden_by_key, token_pool = manifest_hidden_paths(args.hidden_manifest, args.hidden_prefix_from, args.hidden_prefix_to)
+    hidden_by_key, token_pool = manifest_hidden_paths(
+        args.hidden_manifest, args.hidden_prefix_from, args.hidden_prefix_to, args.hidden_path_base,
+    )
     source_csv = Path(args.source_csv).resolve()
     source_path_base = Path(args.source_path_base).resolve()
     source = read_path_label_csv(source_csv)

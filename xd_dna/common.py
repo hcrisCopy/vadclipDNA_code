@@ -227,6 +227,7 @@ def manifest_hidden_paths(
     path: str | Path,
     prefix_from: str = "",
     prefix_to: str = "",
+    path_base: str | Path | None = None,
 ) -> tuple[dict[str, str], str]:
     """Read a staged hidden manifest without relying on the project that made it."""
     manifest_path = Path(path).resolve()
@@ -241,7 +242,12 @@ def manifest_hidden_paths(
     hidden_by_key: dict[str, str] = {}
     for row in frame.itertuples(index=False):
         key, hidden_path = str(row.key), rewrite_prefix(str(row.hidden_path), prefix_from, prefix_to)
-        hidden_path = str(resolve_recorded_path(hidden_path, manifest_path.parent))
+        # DSANet's hidden manifests preserve paths relative to the command's
+        # launch directory, just like its feature CSVs.  They are *not*
+        # relative to manifest.csv.  ``path_base`` makes that legacy contract
+        # explicit while still supporting a different staged data location.
+        base = Path(path_base).resolve() if path_base is not None else Path.cwd().resolve()
+        hidden_path = str(resolve_recorded_path(hidden_path, base))
         if key in hidden_by_key and hidden_by_key[key] != hidden_path:
             raise ValueError(f"{manifest_path}: duplicate key with different hidden paths: {key}")
         hidden_by_key[key] = hidden_path

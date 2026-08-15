@@ -82,6 +82,10 @@ def main() -> None:
     )
     parser.add_argument("--source-train-csv", required=True, help="Reusable XD 512D train CSV with path,label columns.")
     parser.add_argument("--hidden-manifest", required=True, help="Reusable [T,12,768] CLS hidden manifest.")
+    parser.add_argument(
+        "--hidden-path-base", default=".",
+        help="Base directory for relative hidden_path entries in the DSANet manifest; use '.' from vadclipDNA_code.",
+    )
     parser.add_argument("--pseudo-csv", required=True, help="group_scores.csv made by xd_dna.score_pseudo.")
     parser.add_argument("--output-root", default=str(default_output_root()))
     parser.add_argument("--hidden-prefix-from", default="", help="Optional stale hidden-path prefix to rewrite.")
@@ -110,7 +114,7 @@ def main() -> None:
 
     groups = grouped_rows(read_path_label_csv(args.source_train_csv))
     hidden_by_key, token_pool = manifest_hidden_paths(
-        args.hidden_manifest, args.hidden_prefix_from, args.hidden_prefix_to,
+        args.hidden_manifest, args.hidden_prefix_from, args.hidden_prefix_to, args.hidden_path_base,
     )
     pseudo_by_key = read_pseudo_scores(args.pseudo_csv)
 

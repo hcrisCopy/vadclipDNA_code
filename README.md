@@ -39,6 +39,7 @@ python -m xd_dna.score_pseudo \
 python -m xd_dna.build_samples \
   --source-train-csv ../vad_data/work_xd/xd_train_local.csv \
   --hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_train_8gpu/manifest.csv \
+  --hidden-path-base . \
   --pseudo-csv ../vadclipDNA_data/xd_normal_negative_top64/pseudo_scores/group_scores.csv \
   --output-root ../vadclipDNA_data/xd_normal_negative_top64 \
   --validation-fraction 0.20 \
@@ -71,6 +72,7 @@ python -m xd_dna.build_features \
   --source-csv ../vad_data/work_xd/xd_train_local.csv \
   --source-path-base . \
   --hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_train_8gpu/manifest.csv \
+  --hidden-path-base . \
   --neuron-json ../vadclipDNA_data/xd_normal_negative_top64/localization/selected_neurons.json \
   --output-root ../vadclipDNA_data/xd_normal_negative_top64 \
   --alignment crop_hidden \
@@ -81,6 +83,7 @@ python -m xd_dna.build_features \
   --source-csv ../vad_data/work_xd/xd_test_local.csv \
   --source-path-base . \
   --hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_test_8gpu/manifest.csv \
+  --hidden-path-base . \
   --neuron-json ../vadclipDNA_data/xd_normal_negative_top64/localization/selected_neurons.json \
   --output-root ../vadclipDNA_data/xd_normal_negative_top64 \
   --alignment crop_hidden
