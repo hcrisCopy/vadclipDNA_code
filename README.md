@@ -257,4 +257,4 @@ python -m xd_dna.test_ucf \
   --device cuda
 ```
 
-UCF 的训练与 XD 不同：每一步拼接等量 `Normal` 和异常 batch，使用 `batch-size=64`、`lr=2e-5`、`MultiStepLR(4,8)`；严格复现官方 `ucf_train.py` 的保存规则，按分类分支 `AUC1` 保存 `training/model_best.pth`。最终 `test_ucf` 仍输出官方 `AUC1/AP1/AUC2/AP2` 和 detection mAP。
+UCF 的训练与 XD 不同：每一步拼接等量 `Normal` 和异常 batch，使用 `batch-size=64`、`lr=2e-5`、`MultiStepLR(4,8)`；严格复现官方 `ucf_train.py` 的保存规则，按分类分支 `AUC1` 保存 `training/model_best.pth`。最终 `test_ucf` 输出官方 `AUC1/AP1/AUC2/AP2`、detection mAP，以及 VadCLIP Table 2 的 `Ano-AUC1/Ano-AUC2`（仅剔除整段 `Normal` 视频，异常视频中的正常帧仍作为负样本）。

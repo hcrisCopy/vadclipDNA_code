@@ -76,6 +76,7 @@ def main() -> None:
     p1: list[np.ndarray] = []
     p2: list[np.ndarray] = []
     logits: list[np.ndarray] = []
+    labels: list[str] = []
     for item in tqdm(loader, desc="evaluate UCF test videos", unit="video"):
         listed_path, length = str(item[3][0]), int(item[2])
         target = predictions / f"{Path(listed_path).stem}.npz"
@@ -83,10 +84,14 @@ def main() -> None:
         if result is None:
             result = infer_item(model, item, options.visual_length, list(UCF_TEST_LABELS.values()), device)
             atomic_save_npz(target, prob1=result[0], prob2=result[1], logits2=result[2])
-        p1.append(result[0]); p2.append(result[1]); logits.append(result[2])
-    metrics = metrics_from_predictions(p1, p2, logits, gt, gtsegments, gtlabels, dataset="ucf")
+        p1.append(result[0]); p2.append(result[1]); logits.append(result[2]); labels.append(str(item[1][0]))
+    metrics = metrics_from_predictions(p1, p2, logits, gt, gtsegments, gtlabels, dataset="ucf", video_labels=labels)
     save_json(output / "metrics.json", {**metrics.to_dict(), "selection_metric": "AUC1", "model_path": str(model_path), "neuron_json": str(neuron_json), "test_list": args.test_list})
-    print(f"AUC1={metrics.auc1:.6f} AP1={metrics.ap1:.6f} | AUC2={metrics.auc2:.6f} AP2={metrics.ap2:.6f}", flush=True)
+    print(
+        f"AUC1={metrics.auc1:.6f} AP1={metrics.ap1:.6f} | AUC2={metrics.auc2:.6f} AP2={metrics.ap2:.6f} | "
+        f"Ano-AUC1={metrics.ano_auc1:.6f} Ano-AUC2={metrics.ano_auc2:.6f}",
+        flush=True,
+    )
     for iou, value in metrics.detection_map_by_iou.items():
         print(f"mAP@{iou}={value:.2f}%", flush=True)
     print(f"average detection mAP={metrics.detection_map_average:.2f}% | wrote {output / 'metrics.json'}", flush=True)

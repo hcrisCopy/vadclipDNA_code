@@ -149,7 +149,9 @@ def main() -> None:
                 })
                 print(
                     f"epoch {epoch + 1} step {step} | AUC1={metrics.auc1:.6f} AP1={metrics.ap1:.6f} "
-                    f"| AUC2={metrics.auc2:.6f} AP2={metrics.ap2:.6f} | best(AUC1)={best_auc1:.6f}", flush=True,
+                    f"| AUC2={metrics.auc2:.6f} AP2={metrics.ap2:.6f} "
+                    f"| Ano-AUC1={metrics.ano_auc1:.6f} Ano-AUC2={metrics.ano_auc2:.6f} "
+                    f"| best(AUC1)={best_auc1:.6f}", flush=True,
                 )
                 model.train()
         scheduler.step()

@@ -18,6 +18,10 @@ class XDMetrics:
     ap1: float
     auc2: float
     ap2: float
+    ano_auc1: float | None
+    ano_auc2: float | None
+    ano_videos: int | None
+    ano_frame_scores: int | None
     detection_map_by_iou: dict[str, float]
     detection_map_average: float
 
@@ -73,6 +77,7 @@ def metrics_from_predictions(
     gtsegments: np.ndarray,
     gtlabels: np.ndarray,
     dataset: str = "xd",
+    video_labels: list[str] | None = None,
 ) -> XDMetrics:
     add_local_vadclip_source()
     if dataset == "xd":
@@ -86,7 +91,35 @@ def metrics_from_predictions(
     prob2 = np.concatenate(probabilities2, axis=0)
     repeated1, repeated2 = np.repeat(prob1, 16), np.repeat(prob2, 16)
     if len(repeated1) != len(gt):
-        raise ValueError(f"XD frame-ground-truth length mismatch: predictions={len(repeated1)} gt={len(gt)}")
+        raise ValueError(f"{dataset} frame-ground-truth length mismatch: predictions={len(repeated1)} gt={len(gt)}")
+    ano_auc1 = ano_auc2 = None
+    ano_videos = ano_frame_scores = None
+    if dataset == "ucf":
+        if video_labels is None or len(video_labels) != len(probabilities1):
+            raise ValueError("UCF Ano-AUC needs one CSV label per evaluated video")
+        # VadCLIP Table 2's Ano-AUC excludes complete Normal videos only.
+        # Event-free frames within an abnormal video remain negative examples.
+        offset = 0
+        ano_gt: list[np.ndarray] = []
+        ano_prob1: list[np.ndarray] = []
+        ano_prob2: list[np.ndarray] = []
+        for label, video_prob1, video_prob2 in zip(video_labels, probabilities1, probabilities2):
+            frame_count = len(video_prob1) * 16
+            video_gt = gt[offset:offset + frame_count]
+            if len(video_gt) != frame_count or len(video_prob2) != len(video_prob1):
+                raise ValueError("UCF Ano-AUC video-to-ground-truth alignment failed")
+            if str(label) != "Normal":
+                ano_gt.append(video_gt)
+                ano_prob1.append(np.repeat(video_prob1, 16))
+                ano_prob2.append(np.repeat(video_prob2, 16))
+            offset += frame_count
+        if offset != len(gt) or not ano_gt:
+            raise ValueError("UCF Ano-AUC could not construct the anomalous-video-only frame set")
+        ano_gt_array = np.concatenate(ano_gt)
+        ano_auc1 = float(roc_auc_score(ano_gt_array, np.concatenate(ano_prob1)))
+        ano_auc2 = float(roc_auc_score(ano_gt_array, np.concatenate(ano_prob2)))
+        ano_videos = int(sum(str(label) != "Normal" for label in video_labels))
+        ano_frame_scores = int(len(ano_gt_array))
     dmap, ious = getDetectionMAP([np.repeat(item, 16, axis=0) for item in logits2_probability], gtsegments, gtlabels, excludeNormal=False)
     dmap_by_iou = {f"{float(iou):.1f}": float(value) for iou, value in zip(ious, dmap)}
     return XDMetrics(
@@ -94,6 +127,10 @@ def metrics_from_predictions(
         ap1=float(average_precision_score(gt, repeated1)),
         auc2=float(roc_auc_score(gt, repeated2)),
         ap2=float(average_precision_score(gt, repeated2)),
+        ano_auc1=ano_auc1,
+        ano_auc2=ano_auc2,
+        ano_videos=ano_videos,
+        ano_frame_scores=ano_frame_scores,
         detection_map_by_iou=dmap_by_iou,
         detection_map_average=float(np.mean(dmap)),
     )
@@ -116,9 +153,15 @@ def evaluate_loader(
     probabilities1: list[np.ndarray] = []
     probabilities2: list[np.ndarray] = []
     logits2_probability: list[np.ndarray] = []
+    video_labels: list[str] = []
     for item in tqdm(loader, desc=progress, unit="video", leave=False):
         prob1, prob2, logits2 = infer_item(model, item, maxlen, prompt_text, device)
         probabilities1.append(prob1)
         probabilities2.append(prob2)
         logits2_probability.append(logits2)
-    return metrics_from_predictions(probabilities1, probabilities2, logits2_probability, gt, gtsegments, gtlabels, dataset)
+        if dataset == "ucf":
+            video_labels.append(str(item[1][0]))
+    return metrics_from_predictions(
+        probabilities1, probabilities2, logits2_probability, gt, gtsegments, gtlabels,
+        dataset, video_labels if dataset == "ucf" else None,
+    )
