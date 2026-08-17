@@ -1,6 +1,7 @@
 本文件是vadclipDNA_code文件夹下项目文件编写规范
 采用Baseline：VadCLIP: Adapting Vision-Language Models for Weakly Supervised Video Anomaly Detection
 baseline代码：vadclipDNA_code\VadCLIP，禁止修改baseline代码
+注意除了我们自己设计的模块，其余训练，评测和baseline保持一致，比如lr，模型模式设置，checkpoint保存频率，评测指标等等
 1.所有代码，md等文件，必须使用相对路径，方便对接
 2.所有输出放到和vadclipDNA_code同级文件夹vadclipDNA_data中，方便管理
 3.除了我要求修改或者迁移的之外，其余代码逻辑，参数设置等参考原项目vadclipDNA_code\VadCLIP，不要擅自篡改逻辑，不要瞎编代码
