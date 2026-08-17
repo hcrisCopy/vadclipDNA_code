@@ -99,11 +99,9 @@ def main() -> None:
         target = split_dir / f"{feature_path.stem}.npz"
         if not args.no_resume and cached_audit(target, len(feature), lens.abnormal_class_count, args.topk):
             continue
-        clip_start, clip_stop = neuron_width, neuron_width + 512
-        clip = torch.from_numpy(feature[:, clip_start:clip_stop]).unsqueeze(0).to(device)
-        last_hidden = torch.from_numpy(feature[:, clip_stop:]).unsqueeze(0).to(device)
+        last_hidden = torch.from_numpy(feature[:, neuron_width + 512:]).unsqueeze(0).to(device)
         with torch.no_grad():
-            _evidence, route, distance, contributions = lens(clip, last_hidden, temperature=args.text_temperature)
+            _evidence, route, distance, contributions = lens(last_hidden, temperature=args.text_temperature)
         dimensions, values = sorted_top_positive(contributions.squeeze(0).cpu().numpy(), args.topk)
         atomic_save_npz(
             target,

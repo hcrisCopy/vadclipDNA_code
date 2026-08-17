@@ -99,19 +99,10 @@ class TextProjectionLens(nn.Module):
     def abnormal_class_count(self) -> int:
         return int(self.abnormal_text.shape[0])
 
-    def forward(
-        self,
-        clip_feature: torch.Tensor,
-        last_hidden: torch.Tensor,
-        temperature: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, last_hidden: torch.Tensor, temperature: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return full evidence, class routing, normal distance and contributions."""
-        if clip_feature.ndim != 3 or clip_feature.shape[-1] != 512:
-            raise ValueError(f"expected clip feature [B,T,512], got {tuple(clip_feature.shape)}")
-        if last_hidden.shape != (*clip_feature.shape[:2], self.input_width):
-            raise ValueError(
-                f"expected raw final hidden [B,T,{self.input_width}], got {tuple(last_hidden.shape)}"
-            )
+        if last_hidden.ndim != 3 or last_hidden.shape[-1] != self.input_width:
+            raise ValueError(f"expected raw final hidden [B,T,{self.input_width}], got {tuple(last_hidden.shape)}")
         if temperature <= 0:
             raise ValueError("text routing temperature must be positive")
         post = F.layer_norm(
@@ -122,9 +113,9 @@ class TextProjectionLens(nn.Module):
             self.ln_eps,
         )
         centered = post - self.normal_mean.float()
-        normalized_clip = F.normalize(clip_feature.float(), dim=-1, eps=1e-6)
-        abnormal_margin = normalized_clip @ self.abnormal_text.float().t()
-        normal_margin = normalized_clip @ self.normal_text.float()
+        projected_hidden = F.normalize(post @ self.visual_projection.float(), dim=-1, eps=1e-6)
+        abnormal_margin = projected_hidden @ self.abnormal_text.float().t()
+        normal_margin = projected_hidden @ self.normal_text.float()
         class_route = F.softmax((abnormal_margin - normal_margin.unsqueeze(-1)) / float(temperature), dim=-1)
 
         # [B,T,C,768]. All dimensions remain in the residual input.
@@ -138,8 +129,8 @@ class TextProjectionLens(nn.Module):
         flat_z = z.reshape(-1, z.shape[-1])
         normal_distance = torch.cdist(flat_z, self.normal_prototypes.float()).amin(dim=-1).reshape(z.shape[:-1])
         return (
-            text_evidence.to(dtype=clip_feature.dtype),
-            class_route.to(dtype=clip_feature.dtype),
-            normal_distance.to(dtype=clip_feature.dtype),
-            contributions.to(dtype=clip_feature.dtype),
+            text_evidence.to(dtype=last_hidden.dtype),
+            class_route.to(dtype=last_hidden.dtype),
+            normal_distance.to(dtype=last_hidden.dtype),
+            contributions.to(dtype=last_hidden.dtype),
         )

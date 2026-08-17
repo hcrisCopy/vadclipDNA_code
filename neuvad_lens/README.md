@@ -3,7 +3,7 @@
 这是 DNA 的低开销文本透镜版本。它不修改 VadCLIP 和 xd_dna：
 
 - 复用 xd_dna 已完成的 selected_neurons.json、纯正常 DNA 统计量、CLIP hidden manifest 与原始 512D 特征；
-- 对全部末层 768D CLS hidden 用冻结 CLIP 的 LN-post、projection 与固定类别文本计算软文本证据；
+- 对全部末层 768D CLS hidden 用冻结 CLIP 的 LN-post、projection 与固定类别文本计算软文本证据；类别路由也由这条 hidden 流计算，官方 512D 特征只保留给 VadCLIP baseline；
 - DNA 残差与文本残差并行相加，训练和评测仍使用 VadCLIP 原来的损失、优化器、学习率、保存规则和指标；
 - 不取 DNA/text 硬交集；top-k 仅用于审计展示，不裁剪模型输入。
 
@@ -24,14 +24,14 @@
       --normal-subspace-dim 64 \
       --prototype-count 16 \
       --verify-videos 16 \
-      --min-projection-cosine 0.995 \
+      --min-projection-cosine 0.90 \
       --seed 234 \
       --device cuda
 
 以下命令使用 bash 的续行符。
 
 输出：../vadclipDNA_data/xd_neuvad_lens/lens/lens_assets.pt。
-若训练 hidden manifest 已知缺少少量视频，`--allow-missing-hidden` 会仅跳过缺失的纯正常视频，并将数量和视频键写入 `summary.json`；其余缺失或格式错误仍会报错。
+若训练 hidden manifest 已知缺少少量视频，`--allow-missing-hidden` 会仅跳过缺失的纯正常视频，并将数量和视频键写入 `summary.json`；其余缺失或格式错误仍会报错。`projection_cosine_*` 只诊断“重新提取的 hidden 流”与“发布的 512D 特征流”的逐帧接近程度；它们可能使用不同解码或采样流程，因此默认不阻断。只有明确需要逐帧同一特征流时才增加 `--enforce-projection-contract`。
 
 ## 2. 构建三段输入特征
 

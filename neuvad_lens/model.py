@@ -81,9 +81,7 @@ class NeuVADLensVadCLIP(nn.Module):
         clip_feature = visual[..., neuron_stop:clip_stop]
         last_hidden = visual[..., clip_stop:]
         dna_correction = self.dna_to_clip(self.neuron_norm(neurons))
-        text_evidence, _route, normal_distance, _contributions = self.lens(
-            clip_feature, last_hidden, self.text_temperature
-        )
+        text_evidence, _route, normal_distance, _contributions = self.lens(last_hidden, self.text_temperature)
         text_input = torch.cat([text_evidence, normal_distance.unsqueeze(-1)], dim=-1)
         text_correction = self.text_to_clip(text_input)
         correction = dna_correction + text_correction
