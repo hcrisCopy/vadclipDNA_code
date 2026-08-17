@@ -159,7 +159,13 @@ def main() -> None:
     if len(class_names) < 2 or class_names[0] != "normal":
         raise ValueError(f"{args.dataset}: expected the first fixed text class to be normal, got {class_names}")
     with torch.no_grad():
-        text_features = clip_model.encode_text(clip.tokenize(class_names).to(device)).float()
+        # VadCLIP's local CLIP fork exposes the prompt-tuning interface:
+        # encode_text(token_embeddings, token_ids), rather than OpenAI CLIP's
+        # encode_text(token_ids).  Keep the unmodified fixed-text path used by
+        # the baseline by obtaining its token embeddings first.
+        text_tokens = clip.tokenize(class_names).to(device)
+        text_embeddings = clip_model.encode_token(text_tokens)
+        text_features = clip_model.encode_text(text_embeddings, text_tokens).float()
         text_features = F.normalize(text_features, dim=-1, eps=1e-6)
     normal_text = text_features[0]
     abnormal_text = text_features[1:]
