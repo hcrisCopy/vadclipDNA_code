@@ -17,6 +17,7 @@
       --source-path-base . \
       --hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_train_8gpu/manifest.csv \
       --hidden-path-base . \
+      --allow-missing-hidden \
       --output-root ../vadclipDNA_data/xd_neuvad_lens \
       --clip-model ViT-B/16 \
       --last-layer-index -1 \
@@ -30,6 +31,7 @@
 以下命令使用 bash 的续行符。
 
 输出：../vadclipDNA_data/xd_neuvad_lens/lens/lens_assets.pt。
+若训练 hidden manifest 已知缺少少量视频，`--allow-missing-hidden` 会仅跳过缺失的纯正常视频，并将数量和视频键写入 `summary.json`；其余缺失或格式错误仍会报错。
 
 ## 2. 构建三段输入特征
 

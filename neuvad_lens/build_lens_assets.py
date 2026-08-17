@@ -110,6 +110,11 @@ def main() -> None:
     parser.add_argument("--source-path-base", default=".", help="Base for relative original feature paths; use '.' from vadclipDNA_code.")
     parser.add_argument("--hidden-manifest", required=True, help="Reusable [T,12,768] CLS hidden manifest.")
     parser.add_argument("--hidden-path-base", default=".", help="Base for relative hidden_path values; use '.' from vadclipDNA_code.")
+    parser.add_argument(
+        "--allow-missing-hidden",
+        action="store_true",
+        help="Skip pure-normal train videos absent from the hidden manifest and record them in summary.json.",
+    )
     parser.add_argument("--output-root", default=str(default_output_root()))
     parser.add_argument("--hidden-prefix-from", default="")
     parser.add_argument("--hidden-prefix-to", default="")
@@ -177,15 +182,28 @@ def main() -> None:
     )
     normal_keys: list[str] = []
     seen_keys: set[str] = set()
+    missing_normal_keys: list[str] = []
     normal_source_path: dict[str, str] = {}
     for row in source.itertuples(index=False):
         key = base_key(str(row.path))
         if is_pure_normal(args.dataset, str(row.label)) and key not in seen_keys:
+            seen_keys.add(key)
             if key not in hidden_by_key:
-                raise FileNotFoundError(f"{key}: pure-normal train video is absent from hidden manifest")
+                if not args.allow_missing_hidden:
+                    raise FileNotFoundError(
+                        f"{key}: pure-normal train video is absent from hidden manifest; "
+                        "pass --allow-missing-hidden only when this is an expected extraction omission"
+                    )
+                missing_normal_keys.append(key)
+                continue
             normal_keys.append(key)
             normal_source_path[key] = str(row.path)
-            seen_keys.add(key)
+    if missing_normal_keys:
+        print(
+            f"warning: skipped {len(missing_normal_keys)} pure-normal train videos absent from hidden manifest; "
+            "their keys will be recorded in summary.json",
+            flush=True,
+        )
     if len(normal_keys) < 2:
         raise RuntimeError(f"need at least two readable pure-normal videos, found {len(normal_keys)}")
 
@@ -273,6 +291,7 @@ def main() -> None:
         "normal_class_name": class_names[0],
         "abnormal_class_names": class_names[1:],
         "normal_videos": len(normal_keys),
+        "missing_normal_hidden_videos": missing_normal_keys,
         "normal_frames": moments.count,
         "normal_subspace_dim": int(args.normal_subspace_dim),
         "prototype_count": int(filled),
