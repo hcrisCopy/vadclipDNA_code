@@ -17,7 +17,7 @@ CTNC 将每个最终分数的变化分解为可检查的链条：
                     |
 离线发现：层 / 通道 / 对应异常文本 / 正负方向
                     |
-测试时：相对相似正常场景的状态偏离 + 状态转移惊异度
+测试时：检索相似正常帧原型后的反事实状态偏离 + 状态转移惊异度
                     |
 每个文本类别各自得到 hidden evidence
                     |
@@ -36,7 +36,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 - 它经冻结 CLIP `hidden → visual projection → text` 路径与哪一个异常文本最相关；
 - 该通道朝向该文本是正向还是负向；
 - 当前视频最相近的纯正常场景 context；
-- 当前帧相对该 context 的有符号状态偏离；
+- 当前帧匹配到的真实正常 hidden 原型，以及相对该原型的有符号状态偏离；
 - 当前帧相对该 context 的转移惊异度（该通道变化是否不符合正常运动）；
 - 训练后该“通道—文本类别”的 state gate、transition gate、显式语义校正和类别 rank-scale。
 
@@ -48,7 +48,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 
 输入训练集的 reusable hidden states `[T,12,768]` 和训练集视频标签。
 
-1. 只用纯正常视频聚类 scene context，并为每个 context 估计通道正常均值/标准差；
+1. 只用纯正常视频聚类 scene context，并为每个 context 估计通道正常均值/标准差和一小组真实正常 hidden 原型；
 2. 用冻结 CLIP 的最终视觉投影和文本编码器，估计各层各维对异常文本的**有符号**影响；
 3. 对每个异常文本分别计算视频级 weak-label hidden tail 统计，再与该文本的 signed semantic affinity 共同排序；每层按文本均衡地选取稀疏通道，避免高频类别占满候选集；
 4. 写出 `channel_scores.csv` 和 `circuit_assets.pt`。
@@ -65,7 +65,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 - 一个受冻结 CLIP 文本方向约束的、显式可导出的 state 校正量；
 - 每个异常文本类别的 state/transition 证据尺度和 rank-scale。
 
-其中 state 是 hidden 相对正常 context 的有符号偏离，transition 是相对正常 context 的局部变化惊异度；两者都是逐帧、逐 `layer-dimension-text` 可分解的线性证据。读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
+其中 state 是 hidden 相对**最近的真实正常原型**的有符号偏离，transition 是相对正常 context 的局部变化惊异度；两者都是逐帧、逐 `layer-dimension-text` 可分解的线性证据。原型检索避免把同一场景中的不同正常姿态、镜头或运动模式粗暴压成一个均值。读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
 
 ```text
 hidden_evidence(c) = state_scale(c) × state_evidence(c)
@@ -113,6 +113,8 @@ python -m ctnc_vad.discover \
   --candidate-per-layer 32 \
   --context-count 16 \
   --context-iters 50 \
+  --normal-prototype-count 64 \
+  --prototype-frames-per-video 32 \
   --frames-per-video 128 \
   --tail-fraction 0.125 \
   --semantic-weight 0.5 \
@@ -194,7 +196,7 @@ python -m ctnc_vad.audit \
   --device cuda
 ```
 
-`audit/xd_test/circuit_dimensions.csv` 是通道字典；每个视频 `.npz` 包含每帧各异常文本的 `class_evidence`，以及每类贡献最大的通道索引和数值。
+`audit/xd_test/circuit_dimensions.csv` 是通道字典；每个视频 `.npz` 包含每帧各异常文本的 `class_evidence`、匹配的正常原型编号、原型残差，以及每类贡献最大的通道索引和数值。
 
 ## 评测公平性与开销
 

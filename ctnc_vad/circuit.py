@@ -69,6 +69,7 @@ class ChannelRankVerifier(nn.Module):
         self.register_buffer("state_std", assets["state_std"].float().clamp_min(1e-6))
         self.register_buffer("transition_mean", assets["transition_mean"].float())
         self.register_buffer("transition_std", assets["transition_std"].float().clamp_min(1e-6))
+        self.register_buffer("normal_prototypes", assets["normal_prototypes"].float())
         self.register_buffer("selected_layers", assets["selected_layers"].long())
         self.register_buffer("selected_text_direction", assets["selected_text_direction"].float())
         self.register_buffer("selected_text_class", assets["selected_text_class"].long())
@@ -113,6 +114,19 @@ class ChannelRankVerifier(nn.Module):
         state_mean, state_std = self.state_mean[context], self.state_std[context]
         transition_mean, transition_std = self.transition_mean[context], self.transition_std[context]
         normalized_state = torch.tanh((circuit - state_mean.unsqueeze(1)) / (3.0 * state_std.unsqueeze(1)))
+        # The nearest real normal state is the counterfactual reference.  It
+        # fixes the central limitation of a context-wide mean: a frame should
+        # not be called anomalous merely because it differs from another,
+        # nevertheless normal, camera view or motion mode in the same scene.
+        prototypes = self.normal_prototypes[context]  # [B, P, K]
+        state_square = normalized_state.square().sum(dim=-1, keepdim=True)
+        prototype_square = prototypes.square().sum(dim=-1).unsqueeze(1)
+        cross = torch.einsum("btk,bpk->btp", normalized_state, prototypes)
+        nearest_index = (state_square + prototype_square - 2.0 * cross).argmin(dim=-1)
+        nearest_prototype = torch.gather(
+            prototypes, 1, nearest_index.unsqueeze(-1).expand(-1, -1, self.width)
+        )
+        prototype_residual = normalized_state - nearest_prototype
         delta = torch.cat((torch.zeros_like(circuit[:, :1]), circuit[:, 1:] - circuit[:, :-1]), dim=1)
         normalized_transition = torch.tanh(
             (delta - transition_mean.unsqueeze(1)) / (3.0 * transition_std.unsqueeze(1))
@@ -130,7 +144,7 @@ class ChannelRankVerifier(nn.Module):
         transition_weights = self.text_affinity.abs() * transition_gates
         state_denominator = state_weights.square().sum(dim=0).sqrt().clamp_min(1e-6)
         transition_denominator = transition_weights.square().sum(dim=0).sqrt().clamp_min(1e-6)
-        state_evidence = torch.einsum("btk,kc->btc", normalized_state, state_weights)
+        state_evidence = torch.einsum("btk,kc->btc", prototype_residual, state_weights)
         state_evidence = state_evidence / state_denominator.view(1, 1, -1)
         transition_evidence = torch.einsum("btk,kc->btc", transition_novelty, transition_weights)
         transition_evidence = transition_evidence / transition_denominator.view(1, 1, -1)
@@ -143,6 +157,9 @@ class ChannelRankVerifier(nn.Module):
         return {
             "context": context,
             "normalized_state": normalized_state,
+            "nearest_prototype_index": nearest_index,
+            "nearest_prototype": nearest_prototype,
+            "prototype_residual": prototype_residual,
             "normalized_transition": normalized_transition,
             "transition_novelty": transition_novelty,
             "state_gates": state_gates,
@@ -210,7 +227,7 @@ class ChannelRankVerifier(nn.Module):
         }
         if return_channel_contribution:
             result["state_channel_contribution"] = (
-                atoms["normalized_state"].unsqueeze(-1)
+                atoms["prototype_residual"].unsqueeze(-1)
                 * atoms["state_weights"].view(1, 1, self.width, self.anomaly_class_count)
             )
             result["transition_channel_contribution"] = (

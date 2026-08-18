@@ -164,6 +164,14 @@ def main() -> None:
     parser.add_argument("--candidate-per-layer", type=int, default=32)
     parser.add_argument("--context-count", type=int, default=16)
     parser.add_argument("--context-iters", type=int, default=50)
+    parser.add_argument(
+        "--normal-prototype-count", type=int, default=64,
+        help="Real normal hidden states retained per scene context for nearest-normal counterfactual retrieval.",
+    )
+    parser.add_argument(
+        "--prototype-frames-per-video", type=int, default=32,
+        help="Uniform normal frames contributed by each video to the context prototype bank.",
+    )
     parser.add_argument("--frames-per-video", type=int, default=128, help="Maximum cached frames per video used for semantic-lens fitting.")
     parser.add_argument("--tail-fraction", type=float, default=0.125, help="Bag-level upper-tail fraction; never uses a baseline score.")
     parser.add_argument("--semantic-weight", type=float, default=0.5, help="Weight of frozen text-lens evidence in channel selection.")
@@ -181,8 +189,11 @@ def main() -> None:
     args = parser.parse_args()
     if not 0 < args.tail_fraction <= 1 or not 0 <= args.semantic_weight <= 1:
         parser.error("--tail-fraction must be in (0,1] and --semantic-weight must be in [0,1]")
-    if min(args.candidate_per_layer, args.context_count, args.frames_per_video, args.context_iters) <= 0:
-        parser.error("candidate/context/frame counts and context iterations must be positive")
+    if min(
+        args.candidate_per_layer, args.context_count, args.frames_per_video, args.context_iters,
+        args.normal_prototype_count, args.prototype_frames_per_video,
+    ) <= 0:
+        parser.error("candidate/context/prototype/frame counts and context iterations must be positive")
     if args.std_floor <= 0 or args.ridge < 0:
         parser.error("--std-floor must be positive and --ridge must be non-negative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -347,8 +358,30 @@ def main() -> None:
         args.std_floor ** 2,
     ))
 
+    # Pass 5: retain a compact dictionary of *real* normal states for every
+    # scene context. A single Gaussian mean cannot represent normal motion
+    # modes such as different camera views or poses. At test time the reader
+    # retrieves the closest member of this bank, making the counterfactual
+    # "this frame versus this normal state" explicit and inspectable.
+    prototype_candidates: list[list[np.ndarray]] = [[] for _ in range(contexts)]
+    for key, _label, path in tqdm(normal_rows, desc="build normal prototype banks", unit="video"):
+        hidden = load_hidden(path)
+        context = context_of_normal[key]
+        chosen = hidden[:, selected_layers, selected_dimensions]
+        index = uniform_indices(len(chosen), args.prototype_frames_per_video)
+        normalized = np.tanh(
+            (chosen[index] - state_mean[context][None]) / (3.0 * state_std[context][None])
+        ).astype(np.float32)
+        prototype_candidates[context].append(normalized)
+    rng = np.random.default_rng(args.seed)
+    normal_prototypes = np.empty((contexts, args.normal_prototype_count, selected_width), dtype=np.float32)
+    for context, groups_for_context in enumerate(prototype_candidates):
+        candidates = np.concatenate(groups_for_context, axis=0)
+        choose = rng.choice(len(candidates), size=args.normal_prototype_count, replace=len(candidates) < args.normal_prototype_count)
+        normal_prototypes[context] = candidates[choose]
+
     artifact = {
-        "version": 3,
+        "version": 4,
         "dataset": args.dataset,
         "hidden_layers": layers,
         "hidden_width": width,
@@ -366,6 +399,7 @@ def main() -> None:
         "state_std": torch.from_numpy(state_std.astype(np.float32)),
         "transition_mean": torch.from_numpy(transition_mean.astype(np.float32)),
         "transition_std": torch.from_numpy(transition_std.astype(np.float32)),
+        "normal_prototypes": torch.from_numpy(normal_prototypes),
         "ln_post_weight": torch.from_numpy(ln_weight),
         "ln_post_bias": torch.from_numpy(ln_bias),
         "ln_post_eps": ln_eps,
@@ -429,6 +463,8 @@ def main() -> None:
         "class_training_videos": {prompts[index + 1]: int(count) for index, count in enumerate(class_bags)},
         "candidate_per_layer": args.candidate_per_layer,
         "context_count": contexts,
+        "normal_prototype_count": args.normal_prototype_count,
+        "prototype_frames_per_video": args.prototype_frames_per_video,
         "selection": "weak bag tail contrast plus signed frozen hidden-to-text semantic directions; no VadCLIP score is used",
         "assets": relpath(asset_path, output),
     })

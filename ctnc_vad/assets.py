@@ -9,7 +9,7 @@ import torch
 REQUIRED_KEYS = {
     "version", "dataset", "hidden_layers", "hidden_width", "selected_layers", "selected_dimensions",
     "selected_text_direction", "selected_text_class", "selected_text_affinity",
-    "context_centers", "state_mean", "state_std", "transition_mean", "transition_std",
+    "context_centers", "state_mean", "state_std", "transition_mean", "transition_std", "normal_prototypes",
     "ln_post_weight", "ln_post_bias", "ln_post_eps", "visual_projection", "text_features",
 }
 
@@ -41,6 +41,13 @@ def load_assets(path: str | Path, device: torch.device | str = "cpu") -> dict:
         value = artifact[key]
         if not isinstance(value, torch.Tensor) or value.ndim != 2 or value.shape[1] != selected_width:
             raise ValueError(f"{path}: {key} must have shape [contexts,{selected_width}]")
+    prototypes = artifact["normal_prototypes"]
+    if (
+        not isinstance(prototypes, torch.Tensor) or prototypes.ndim != 3
+        or prototypes.shape[0] != artifact["state_mean"].shape[0]
+        or prototypes.shape[2] != selected_width
+    ):
+        raise ValueError(f"{path}: normal_prototypes must have shape [contexts,prototypes,{selected_width}]")
     return artifact
 
 
