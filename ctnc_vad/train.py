@@ -68,6 +68,10 @@ def main() -> None:
     parser.add_argument("--normal-frame-weight", type=float, default=0.25)
     parser.add_argument("--preserve-weight", type=float, default=0.01, help="Keep uncertain outputs close to the frozen baseline.")
     parser.add_argument("--sparsity-weight", type=float, default=1e-3)
+    parser.add_argument(
+        "--hidden-mil-weight", type=float, default=1.0,
+        help="Video-label MIL supervision for the class-specific hidden circuit itself.",
+    )
     parser.add_argument("--gate-initial-logit", type=float, default=0.0)
     parser.add_argument(
         "--verification-initial-logit", type=float, default=-1.5,
@@ -89,7 +93,7 @@ def main() -> None:
         raise ValueError("--clean and --resume cannot be used together")
     if args.max_epoch <= 0 or args.num_workers < 0 or args.scheduler_rate <= 0:
         parser.error("epochs and scheduler rate must be positive; workers may be zero")
-    if min(args.normal_frame_weight, args.preserve_weight, args.sparsity_weight) < 0:
+    if min(args.normal_frame_weight, args.preserve_weight, args.sparsity_weight, args.hidden_mil_weight) < 0:
         parser.error("loss weights must be non-negative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -169,7 +173,7 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.max_epoch):
         model.train()
-        totals = {"loss": 0.0, "bag": 0.0, "normal": 0.0, "preserve": 0.0, "sparse": 0.0}
+        totals = {"loss": 0.0, "bag": 0.0, "hidden_bag": 0.0, "normal": 0.0, "preserve": 0.0, "sparse": 0.0}
         batches = 0
         progress = tqdm(train_loader, desc=f"CTNC train {epoch + 1}/{args.max_epoch}", unit="batch")
         for circuit, last_hidden, baseline_probability, lengths, class_targets in progress:
@@ -180,14 +184,20 @@ def main() -> None:
             class_targets = class_targets.to(device, non_blocking=True)
             outputs = model(circuit, last_hidden, baseline_probability, lengths)
             loss, pieces = verifier_loss(
-                outputs, class_targets, lengths, args.normal_frame_weight, args.preserve_weight, args.sparsity_weight
+                outputs,
+                class_targets,
+                lengths,
+                args.normal_frame_weight,
+                args.preserve_weight,
+                args.sparsity_weight,
+                args.hidden_mil_weight,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             batches += 1
             totals["loss"] += float(loss.detach())
-            for name in ("bag", "normal", "preserve", "sparse"):
+            for name in ("bag", "hidden_bag", "normal", "preserve", "sparse"):
                 totals[name] += pieces[name]
             progress.set_postfix(
                 loss=f"{float(loss.detach()):.4f}",
@@ -212,6 +222,7 @@ def main() -> None:
             "epoch": epoch + 1,
             "loss": totals["loss"] / max(1, batches),
             "bag_loss": totals["bag"] / max(1, batches),
+            "hidden_bag_loss": totals["hidden_bag"] / max(1, batches),
             "normal_loss": totals["normal"] / max(1, batches),
             "preserve_loss": totals["preserve"] / max(1, batches),
             "gate_mean": totals["sparse"] / max(1, batches),

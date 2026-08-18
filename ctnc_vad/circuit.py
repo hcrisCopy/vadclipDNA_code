@@ -27,10 +27,11 @@ class ChannelRankVerifier(nn.Module):
     """Interpretable class-wise product-of-experts over frozen VadCLIP output.
 
     ``baseline_probability`` contains the original VadCLIP prompt
-    probabilities ``[normal, anomaly_1, ...]``. The only learned variables are
-    one gate per discovered hidden coordinate and one non-negative gain per
-    anomaly prompt. Thus every final-score change can be traced to a layer, a
-    coordinate, its normal-state deviation, and a text prompt.
+    probabilities ``[normal, anomaly_1, ...]``. The learned variables are a
+    sparse gate for every ``(hidden coordinate, anomaly prompt)`` pair, a
+    prompt gain, and a global strength. Thus every final-score change can be
+    traced to a layer, a coordinate, its normal-state deviation, and a text
+    prompt; there is no opaque feature mixer.
     """
 
     def __init__(
@@ -66,9 +67,16 @@ class ChannelRankVerifier(nn.Module):
         # The signed affinity itself is retained as the explanation.
         scale = affinity.abs().mean(dim=0, keepdim=True).clamp_min(1e-6)
         self.register_buffer("text_affinity", affinity / scale)
-        self.gate_logits = nn.Parameter(torch.full((width,), float(gate_initial_logit)))
+        # Different anomaly texts need not use the same CLIP coordinate. The
+        # gate matrix is still fully auditable: row k / column c is exactly
+        # the contribution permission for hidden coordinate k and text c.
+        self.class_gate_logits = nn.Parameter(
+            torch.full((width, self.anomaly_class_count), float(gate_initial_logit))
+        )
         self.class_gain_logits = nn.Parameter(torch.full((self.anomaly_class_count,), -0.5))
         self.verification_logit = nn.Parameter(torch.tensor(float(verification_initial_logit)))
+        self.hidden_temperature_logits = nn.Parameter(torch.zeros(self.anomaly_class_count))
+        self.hidden_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -3.0))
 
     def _context_indices(self, last_hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         signature = F.normalize(masked_mean(last_hidden, mask), dim=-1, eps=1e-6)
@@ -76,17 +84,20 @@ class ChannelRankVerifier(nn.Module):
 
     def _channel_state(
         self, circuit: torch.Tensor, last_hidden: torch.Tensor, mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         context = self._context_indices(last_hidden, mask)
         state_mean, state_std = self.state_mean[context], self.state_std[context]
         # The bounded standardized deviation is the primitive explanation. It
         # is comparable across layers/coordinates and robust to one outlier.
         normalized_state = torch.tanh((circuit - state_mean.unsqueeze(1)) / (3.0 * state_std.unsqueeze(1)))
-        gates = torch.sigmoid(self.gate_logits)
-        weighted_state = normalized_state * gates.view(1, 1, -1)
-        denominator = (gates.unsqueeze(1) * self.text_affinity.abs()).sum(dim=0).clamp_min(1e-6)
-        class_evidence = torch.einsum("btk,kc->btc", weighted_state, self.text_affinity) / denominator.view(1, 1, -1)
-        return context, normalized_state, gates, class_evidence
+        class_gates = torch.sigmoid(self.class_gate_logits)
+        text_weight = self.text_affinity * class_gates
+        denominator = text_weight.abs().sum(dim=0).clamp_min(1e-6)
+        class_evidence = torch.einsum("btk,kc->btc", normalized_state, text_weight) / denominator.view(1, 1, -1)
+        # This aggregate is used only for a compact per-coordinate summary;
+        # class_gates retains the actual class-specific explanation.
+        gates = class_gates.mean(dim=1)
+        return context, normalized_state, gates, class_gates, class_evidence
 
     def forward(
         self,
@@ -105,7 +116,7 @@ class ChannelRankVerifier(nn.Module):
             raise ValueError(f"baseline probabilities must have shape {expected}, got {tuple(baseline_probability.shape)}")
         times = torch.arange(circuit.shape[1], device=circuit.device).unsqueeze(0)
         mask = times < lengths.unsqueeze(1)
-        context, normalized_state, gates, class_evidence = self._channel_state(circuit, last_hidden, mask)
+        context, normalized_state, gates, class_gates, class_evidence = self._channel_state(circuit, last_hidden, mask)
 
         # Product-of-experts fusion: log frozen probabilities + transparent
         # hidden likelihood factors. This is output re-ranking, not an injected
@@ -119,10 +130,15 @@ class ChannelRankVerifier(nn.Module):
         verified_all = verified_all.masked_fill(~mask.unsqueeze(-1), 0.0)
         verified = 1.0 - verified_all[..., 0]
 
-        # This reports whether the discovered circuit itself predicts anomaly,
-        # independently of the frozen VAD output used for final re-ranking.
-        hidden_only = F.softmax(torch.cat((torch.zeros_like(class_evidence[..., :1]), class_evidence), dim=-1), dim=-1)
-        hidden_anomaly = (1.0 - hidden_only[..., 0]).masked_fill(~mask, 0.0)
+        # A direct hidden MIL head trains the sparse circuit to be meaningful
+        # even when a frozen baseline initially assigns very low probability to
+        # the correct class. Its parameters are only class temperatures and
+        # priors, not a hidden MLP, so its scores stay traceable to channels.
+        hidden_temperature = F.softplus(self.hidden_temperature_logits)
+        hidden_probability = torch.sigmoid(
+            class_evidence * hidden_temperature.view(1, 1, -1) + self.hidden_bias.view(1, 1, -1)
+        )
+        hidden_anomaly = (1.0 - (1.0 - hidden_probability).prod(dim=-1)).masked_fill(~mask, 0.0)
         result = {
             "score": verified,
             "verified_all": verified_all,
@@ -131,8 +147,10 @@ class ChannelRankVerifier(nn.Module):
             "context": context,
             "normalized_state": normalized_state,
             "class_evidence": class_evidence,
+            "hidden_probability": hidden_probability,
             "hidden_anomaly": hidden_anomaly,
             "gates": gates,
+            "class_gates": class_gates,
             "class_gains": gains,
             "verification_strength": strength,
         }
@@ -141,7 +159,7 @@ class ChannelRankVerifier(nn.Module):
             # unnecessary [B,T,K,C] training allocation.
             result["channel_contribution"] = (
                 normalized_state.unsqueeze(-1)
-                * gates.view(1, 1, -1, 1)
+                * class_gates.view(1, 1, self.width, self.anomaly_class_count)
                 * self.text_affinity.view(1, 1, self.width, self.anomaly_class_count)
             )
         return result
@@ -164,6 +182,7 @@ def verifier_loss(
     normal_weight: float,
     preserve_weight: float,
     sparsity_weight: float,
+    hidden_mil_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Official video-category MIL supervision plus a frozen-output tether.
 
@@ -172,6 +191,8 @@ def verifier_loss(
     """
     pooled = mil_topk_mean(outputs["verified_all"][..., 1:], lengths)
     bag = F.binary_cross_entropy(pooled, class_targets)
+    hidden_pooled = mil_topk_mean(outputs["hidden_probability"], lengths)
+    hidden_bag = F.binary_cross_entropy(hidden_pooled, class_targets)
     normal = class_targets.sum(dim=-1) < 0.5
     if bool(normal.any()):
         normal_score = outputs["score"][normal]
@@ -181,10 +202,17 @@ def verifier_loss(
         normal_loss = torch.zeros((), device=class_targets.device)
     difference = (outputs["verified_all"] - outputs["baseline_probability"]).abs().mean(dim=-1)
     preserve = (difference * outputs["mask"].to(difference.dtype)).sum() / outputs["mask"].sum().clamp_min(1)
-    sparse = outputs["gates"].mean()
-    total = bag + float(normal_weight) * normal_loss + float(preserve_weight) * preserve + float(sparsity_weight) * sparse
+    sparse = outputs["class_gates"].mean()
+    total = (
+        bag
+        + float(hidden_mil_weight) * hidden_bag
+        + float(normal_weight) * normal_loss
+        + float(preserve_weight) * preserve
+        + float(sparsity_weight) * sparse
+    )
     return total, {
         "bag": float(bag.detach()),
+        "hidden_bag": float(hidden_bag.detach()),
         "normal": float(normal_loss.detach()),
         "preserve": float(preserve.detach()),
         "sparse": float(sparse.detach()),

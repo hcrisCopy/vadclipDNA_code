@@ -30,6 +30,7 @@ from .common import (
     relpath,
     save_json,
     stage_dir,
+    video_label_vector,
     write_csv,
     atomic_torch_save,
 )
@@ -61,6 +62,68 @@ def rank_within_layer(values: np.ndarray) -> np.ndarray:
         order = np.argsort(values[layer], kind="stable")
         rank[layer, order] = np.linspace(0.0, 1.0, values.shape[1], dtype=np.float32)
     return rank
+
+
+def rank_within_layer_and_class(values: np.ndarray) -> np.ndarray:
+    """Rank ``[layer, dimension, text-class]`` scores within each layer/text.
+
+    It keeps sparse discovery balanced across anomaly concepts rather than
+    letting a frequent class (or one large numeric text response) consume all
+    hidden coordinates.
+    """
+    if values.ndim != 3:
+        raise ValueError(f"expected [layer, dimension, class], got {values.shape}")
+    rank = np.empty_like(values, dtype=np.float32)
+    for layer in range(values.shape[0]):
+        for text_class in range(values.shape[2]):
+            order = np.argsort(values[layer, :, text_class], kind="stable")
+            rank[layer, order, text_class] = np.linspace(0.0, 1.0, values.shape[1], dtype=np.float32)
+    return rank
+
+
+def choose_text_balanced_dimensions(scores: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Choose exactly ``count`` unique dimensions per layer, covering all texts.
+
+    ``scores`` is ``[layer, dimension, anomaly_text]``.  The returned second
+    array records which text caused each coordinate to enter the circuit.
+    """
+    layers, dimensions, texts = scores.shape
+    if count < texts:
+        raise ValueError("candidate-per-layer must be at least the number of anomaly text classes")
+    chosen_dims = np.empty((layers, count), dtype=np.int64)
+    chosen_texts = np.empty((layers, count), dtype=np.int64)
+    per_text = count // texts
+    for layer in range(layers):
+        selected: list[tuple[int, int]] = []
+        used: set[int] = set()
+        for text_class in range(texts):
+            ranking = np.argsort(-scores[layer, :, text_class], kind="stable")
+            added = 0
+            for dimension in ranking:
+                value = int(dimension)
+                if value in used:
+                    continue
+                selected.append((value, text_class))
+                used.add(value)
+                added += 1
+                if added == per_text:
+                    break
+        # Remainder and duplicate conflicts are filled by the best remaining
+        # score across all texts, retaining the responsible text class.
+        flattened = np.argsort(-scores[layer].reshape(-1), kind="stable")
+        for flat in flattened:
+            dimension, text_class = np.unravel_index(int(flat), (dimensions, texts))
+            if int(dimension) in used:
+                continue
+            selected.append((int(dimension), int(text_class)))
+            used.add(int(dimension))
+            if len(selected) == count:
+                break
+        if len(selected) != count:
+            raise RuntimeError("could not select the requested number of unique text-balanced dimensions")
+        chosen_dims[layer] = [dimension for dimension, _text_class in selected]
+        chosen_texts[layer] = [text_class for _dimension, text_class in selected]
+    return chosen_dims, chosen_texts
 
 
 def load_clip_text_route(model_name: str, prompts: list[str], device: torch.device) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
@@ -180,6 +243,11 @@ def main() -> None:
     context_of_normal = {key: int(context) for key, context in zip(normal_keys, context_assignments)}
 
     prompts = list(labels_for_dataset(args.dataset).values())
+    anomaly_text_count = len(prompts) - 1
+    if args.candidate_per_layer < anomaly_text_count:
+        raise ValueError(
+            f"candidate-per-layer={args.candidate_per_layer} must cover all {anomaly_text_count} anomaly text classes"
+        )
     ln_weight, ln_bias, projection, ln_eps, text_features = load_clip_text_route(args.clip_model, prompts, torch.device(args.device))
     if projection.shape != (width, 512) or text_features.shape[1] != 512:
         raise ValueError("the selected CLIP model is incompatible with cached ViT-B/16 hidden states")
@@ -203,12 +271,14 @@ def main() -> None:
     # key distinction from the old direction-free absolute deviation score.
     text_directions = text_features[1:] - text_features[:1]
     semantic_response = np.einsum("ldk,ck->ldc", semantic_lens, text_directions).astype(np.float32)
-    semantic_score = np.abs(semantic_response).max(axis=-1).astype(np.float32)
+    semantic_text_score = np.abs(semantic_response).astype(np.float32)
+    semantic_score = semantic_text_score.max(axis=-1)
 
     # Pass 3: weak bag statistics.  The tail is over a hidden coordinate, not a baseline prediction.
     normal_tail_sum = np.zeros((layers, width), dtype=np.float64)
-    abnormal_tail_sum = np.zeros_like(normal_tail_sum)
-    normal_bags = abnormal_bags = 0
+    class_tail_sum = np.zeros((anomaly_text_count, layers, width), dtype=np.float64)
+    normal_bags = 0
+    class_bags = np.zeros(anomaly_text_count, dtype=np.int64)
     for key, label, path in tqdm(rows, desc="bag-level circuit evidence", unit="video"):
         hidden = load_hidden(path)
         if hidden.shape[1:] != (layers, width):
@@ -218,13 +288,22 @@ def main() -> None:
             normal_tail_sum += tail
             normal_bags += 1
         else:
-            abnormal_tail_sum += tail
-            abnormal_bags += 1
-    discriminative_score = (abnormal_tail_sum / abnormal_bags - normal_tail_sum / normal_bags).astype(np.float32)
-    discriminative_rank = rank_within_layer(discriminative_score)
-    semantic_rank = rank_within_layer(semantic_score)
-    combined_score = (1.0 - args.semantic_weight) * discriminative_rank + args.semantic_weight * semantic_rank
-    chosen_dims = np.argsort(-combined_score, axis=1, kind="stable")[:, :args.candidate_per_layer]
+            target = video_label_vector(args.dataset, label)[1:]
+            for text_class in np.flatnonzero(target):
+                class_tail_sum[text_class] += tail
+                class_bags[text_class] += 1
+    if np.any(class_bags == 0):
+        absent = [prompts[index + 1] for index in np.flatnonzero(class_bags == 0)]
+        raise ValueError(f"training labels contain no videos for anomaly text classes: {absent}")
+    class_discriminative_score = (
+        class_tail_sum / class_bags[:, None, None] - normal_tail_sum[None] / normal_bags
+    ).transpose(1, 2, 0).astype(np.float32)
+    discriminative_score = class_discriminative_score.max(axis=-1)
+    discriminative_rank = rank_within_layer_and_class(class_discriminative_score)
+    semantic_rank = rank_within_layer_and_class(semantic_text_score)
+    combined_text_score = (1.0 - args.semantic_weight) * discriminative_rank + args.semantic_weight * semantic_rank
+    combined_score = combined_text_score.max(axis=-1)
+    chosen_dims, selection_text_classes = choose_text_balanced_dimensions(combined_text_score, args.candidate_per_layer)
     selected_layers = np.repeat(np.arange(layers, dtype=np.int64), args.candidate_per_layer)
     selected_dimensions = chosen_dims.reshape(-1).astype(np.int64)
     selected_width = len(selected_layers)
@@ -269,7 +348,7 @@ def main() -> None:
     ))
 
     artifact = {
-        "version": 2,
+        "version": 3,
         "dataset": args.dataset,
         "hidden_layers": layers,
         "hidden_width": width,
@@ -280,6 +359,7 @@ def main() -> None:
         "selected_dimensions": torch.from_numpy(selected_dimensions),
         "selected_text_direction": torch.from_numpy(selected_text_direction),
         "selected_text_class": torch.from_numpy(selected_text_class),
+        "selected_by_text_class": torch.from_numpy(selection_text_classes.reshape(-1).astype(np.int64) + 1),
         "selected_text_affinity": torch.from_numpy(selected_affinity),
         "context_centers": torch.from_numpy(context_centers),
         "state_mean": torch.from_numpy(state_mean.astype(np.float32)),
@@ -312,6 +392,23 @@ def main() -> None:
         ],
         table_rows,
     )
+    class_table_rows = []
+    for layer in range(layers):
+        for dimension in range(width):
+            for text_class in range(anomaly_text_count):
+                class_table_rows.append([
+                    layer + 1,
+                    dimension,
+                    prompts[text_class + 1],
+                    float(class_discriminative_score[layer, dimension, text_class]),
+                    float(semantic_response[layer, dimension, text_class]),
+                    float(combined_text_score[layer, dimension, text_class]),
+                ])
+    write_csv(
+        output / "channel_text_scores.csv",
+        ["layer_1based", "dimension", "anomaly_text", "class_tail_discriminative", "signed_semantic_lens", "combined"],
+        class_table_rows,
+    )
     write_csv(output / "missing_hidden.csv", ["video_key", "label"], missing)
     if missing:
         print(
@@ -329,6 +426,7 @@ def main() -> None:
         "missing_videos": len(missing),
         "hidden_shape": [layers, width],
         "selected_width": selected_width,
+        "class_training_videos": {prompts[index + 1]: int(count) for index, count in enumerate(class_bags)},
         "candidate_per_layer": args.candidate_per_layer,
         "context_count": contexts,
         "selection": "weak bag tail contrast plus signed frozen hidden-to-text semantic directions; no VadCLIP score is used",

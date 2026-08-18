@@ -46,6 +46,7 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
         "normalized_state": outputs["normalized_state"][0, :length].cpu().numpy().astype(np.float32),
         "normal_context": outputs["context"].cpu().numpy().astype(np.int64),
         "gate": outputs["gates"].cpu().numpy().astype(np.float32),
+        "class_gate": outputs["class_gates"].cpu().numpy().astype(np.float32),
         "class_gain": outputs["class_gains"].cpu().numpy().astype(np.float32),
         "verification_strength": outputs["verification_strength"].reshape(1).cpu().numpy().astype(np.float32),
         "top_circuit_index_by_class": indices.cpu().numpy().astype(np.int64),
@@ -115,11 +116,12 @@ def main() -> None:
     write_csv(output / "index.csv", ["video_key", "label", "length", "audit_file", "action"], rows)
     write_csv(
         output / "circuit_dimensions.csv",
-        ["circuit_index", "layer_1based", "dimension", "anomaly_text", "signed_direction"],
+        ["circuit_index", "layer_1based", "dimension", "dominant_anomaly_text", "selection_text", "signed_direction"],
         [
             [
                 index, int(layer) + 1, int(dimension),
                 assets["prompts"][int(assets["selected_text_class"][index])],
+                assets["prompts"][int(assets.get("selected_by_text_class", assets["selected_text_class"])[index])],
                 float(assets["selected_text_direction"][index]),
             ]
             for index, (layer, dimension) in enumerate(zip(selected_layers, selected_dimensions))

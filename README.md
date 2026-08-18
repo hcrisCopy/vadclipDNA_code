@@ -37,7 +37,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 - 该通道朝向该文本是正向还是负向；
 - 当前视频最相近的纯正常场景 context；
 - 当前帧相对该 context 的标准化偏离；
-- 训练后该通道 gate 和该文本类别 gain。
+- 训练后该“通道—文本类别” gate、该文本类别 gain 和全局融合强度。
 
 因此，对某帧“为什么提高 shooting / explosion 概率”可以直接导出贡献最大的 `layer-dimension-text-direction`，而不是解释黑箱 residual 特征。`ctnc_vad.audit` 会逐视频写出这些证据。
 
@@ -49,7 +49,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 
 1. 只用纯正常视频聚类 scene context，并为每个 context 估计通道正常均值/标准差；
 2. 用冻结 CLIP 的最终视觉投影和文本编码器，估计各层各维对异常文本的**有符号**影响；
-3. 以视频级弱标签的 hidden tail 统计与文本相关性共同选取稀疏通道；
+3. 对每个异常文本分别计算视频级 weak-label hidden tail 统计，再与该文本的 signed semantic affinity 共同排序；每层按文本均衡地选取稀疏通道，避免高频类别占满候选集；
 4. 写出 `channel_scores.csv` 和 `circuit_assets.pt`。
 
 这一阶段不读取、也不阈值化 VadCLIP 的预测，因而没有 baseline 伪正/负样本构造。
@@ -60,11 +60,11 @@ softmax 后的类别概率与异常分数（排序/定位）
 
 小型 reader 仅学习：
 
-- 每个已发现通道的一个 gate；
+- 每个已发现的“通道—异常文本”对的一个 gate；
 - 每个异常文本类别的一个非负 gain；
 - 一个全局 hidden-evidence strength。
 
-对类别 `c` 的融合是：
+同时，读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
 
 ```text
 log p_final(c) = log p_frozen(c)
@@ -143,6 +143,7 @@ python -m ctnc_vad.train \
   --normal-frame-weight 0.25 \
   --preserve-weight 0.01 \
   --sparsity-weight 0.001 \
+  --hidden-mil-weight 1.0 \
   --verification-initial-logit -1.5 \
   --alignment crop_hidden \
   --seed 234 \
