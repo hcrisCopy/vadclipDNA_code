@@ -187,7 +187,12 @@ def grouped_source_rows(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
     work["_ctnc_key"] = work["path"].map(base_key)
     work["_ctnc_chunk"] = work["path"].map(chunk_index)
     groups: dict[str, pd.DataFrame] = {}
-    for key, group in work.groupby("_ctnc_key", sort=True):
+    # Evaluation labels in VadCLIP's gt.npy are concatenated in the source
+    # test CSV order.  Never sort by video key here: doing so silently
+    # misaligns every prediction with its frame-level ground truth.
+    # ``sort=False`` still groups XD's __0 ... __9 training augmentations,
+    # while preserving the first-occurrence order of individual test videos.
+    for key, group in work.groupby("_ctnc_key", sort=False):
         labels = set(group["label"].astype(str))
         if len(labels) != 1:
             raise ValueError(f"video {key!r} has inconsistent labels {sorted(labels)}")
