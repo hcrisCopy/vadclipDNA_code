@@ -169,3 +169,23 @@ def verifier_loss(
         "sparse": float(sparse.detach()), "pooled_normal": float(pooled[normal].mean().detach()) if bool(normal.any()) else float("nan"),
         "pooled_abnormal": float(pooled[~normal].mean().detach()) if bool((~normal).any()) else float("nan"),
     }
+
+
+def rectified_class_probabilities(original: torch.Tensor | object, verified_score: torch.Tensor | object):
+    """Keep VadCLIP's abnormal-class conditional distribution for dMAP.
+
+    The verifier changes only normal-versus-abnormal confidence. The relative
+    probabilities among VadCLIP's existing abnormal classes remain frozen.
+    """
+    import numpy as np
+
+    probability = np.asarray(original, dtype=np.float32)
+    score = np.asarray(verified_score, dtype=np.float32).reshape(-1)
+    if probability.ndim != 2 or len(probability) != len(score) or probability.shape[1] < 2:
+        raise ValueError("invalid frozen VadCLIP class-probability contract")
+    abnormal = probability[:, 1:]
+    conditional = abnormal / np.maximum(abnormal.sum(axis=1, keepdims=True), 1e-6)
+    result = np.empty_like(probability)
+    result[:, 0] = 1.0 - score
+    result[:, 1:] = conditional * score[:, None]
+    return result
