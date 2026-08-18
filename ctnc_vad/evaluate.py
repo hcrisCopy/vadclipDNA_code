@@ -97,7 +97,7 @@ def collect_predictions(
             }
             context = int(detail["context"][0])
             if target is not None:
-                atomic_save_npz(target, **result, context=np.asarray([context], dtype=np.int64), **detail)
+                atomic_save_npz(target, **result, **detail)
             action = "new"
         for name, values in result.items():
             output[name].append(values)
