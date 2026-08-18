@@ -10,6 +10,7 @@ REQUIRED_KEYS = {
     "version", "dataset", "hidden_layers", "hidden_width", "selected_layers", "selected_dimensions",
     "selected_text_direction", "selected_text_class", "selected_text_affinity",
     "context_centers", "state_mean", "state_std", "transition_mean", "transition_std", "normal_prototypes",
+    "normal_subspace_basis", "subspace_rank",
     "ln_post_weight", "ln_post_bias", "ln_post_eps", "visual_projection", "text_features",
 }
 
@@ -48,6 +49,18 @@ def load_assets(path: str | Path, device: torch.device | str = "cpu") -> dict:
         or prototypes.shape[2] != selected_width
     ):
         raise ValueError(f"{path}: normal_prototypes must have shape [contexts,prototypes,{selected_width}]")
+    basis = artifact["normal_subspace_basis"]
+    rank = int(artifact["subspace_rank"])
+    hidden_layers = int(artifact["hidden_layers"])
+    per_layer = selected_width // hidden_layers
+    if (
+        selected_width % hidden_layers != 0
+        or not isinstance(basis, torch.Tensor) or basis.ndim != 4
+        or tuple(basis.shape[:2]) != (artifact["state_mean"].shape[0], hidden_layers)
+        or basis.shape[2] != per_layer or basis.shape[3] != rank
+        or rank <= 0 or rank > per_layer
+    ):
+        raise ValueError(f"{path}: invalid per-context normal subspace basis")
     return artifact
 
 

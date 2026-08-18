@@ -175,6 +175,10 @@ def main() -> None:
         "--prototype-frames-per-video", type=int, default=32,
         help="Uniform normal frames contributed by each video to the context prototype bank.",
     )
+    parser.add_argument(
+        "--subspace-rank", type=int, default=16,
+        help="Rank of each normal SVD subspace; residuals remain original selected hidden channels.",
+    )
     parser.add_argument("--frames-per-video", type=int, default=128, help="Maximum cached frames per video used for semantic-lens fitting.")
     parser.add_argument("--tail-fraction", type=float, default=0.125, help="Bag-level upper-tail fraction; never uses a baseline score.")
     parser.add_argument("--semantic-weight", type=float, default=0.5, help="Weight of frozen text-lens evidence in channel selection.")
@@ -194,11 +198,13 @@ def main() -> None:
         parser.error("--tail-fraction must be in (0,1] and --semantic-weight must be in [0,1]")
     if min(
         args.candidate_per_layer, args.context_count, args.frames_per_video, args.context_iters,
-        args.normal_prototype_count, args.prototype_frames_per_video,
+        args.normal_prototype_count, args.prototype_frames_per_video, args.subspace_rank,
     ) <= 0:
         parser.error("candidate/context/prototype/frame counts and context iterations must be positive")
     if args.std_floor <= 0 or args.ridge < 0:
         parser.error("--std-floor must be positive and --ridge must be non-negative")
+    if args.subspace_rank > args.candidate_per_layer:
+        parser.error("--subspace-rank must not exceed --candidate-per-layer")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
@@ -207,7 +213,7 @@ def main() -> None:
     asset_path = output / "circuit_assets.pt"
     if asset_path.is_file() and not args.no_resume:
         old = torch.load(asset_path, map_location="cpu", weights_only=False)
-        if isinstance(old, dict) and int(old.get("version", -1)) == 5:
+        if isinstance(old, dict) and int(old.get("version", -1)) == 6:
             print(f"reuse {asset_path}; pass --no-resume or --clean to rebuild discovery", flush=True)
             return
         print(f"rebuild {asset_path}: old discovery version is incompatible with channel witnesses", flush=True)
@@ -370,14 +376,23 @@ def main() -> None:
     # retrieves the closest member of this bank, making the counterfactual
     # "this frame versus this normal state" explicit and inspectable.
     prototype_candidates: list[list[np.ndarray]] = [[] for _ in range(contexts)]
+    # The basis is fitted only on the selected channels, per normal context
+    # and per layer. It is a normal reference, not a learned feature: the
+    # residual is still indexed by the original layer--dimension coordinate.
+    per_layer = args.candidate_per_layer
+    subspace_cross = np.zeros((contexts, layers, per_layer, per_layer), dtype=np.float64)
+    subspace_count = np.zeros(contexts, dtype=np.int64)
     for key, _label, path in tqdm(normal_rows, desc="build normal prototype banks", unit="video"):
         hidden = load_hidden(path)
         context = context_of_normal[key]
         chosen = hidden[:, selected_layers, selected_dimensions]
         index = uniform_indices(len(chosen), args.prototype_frames_per_video)
-        normalized = np.tanh(
-            (chosen[index] - state_mean[context][None]) / (3.0 * state_std[context][None])
-        ).astype(np.float32)
+        standardized = (chosen[index] - state_mean[context][None]) / state_std[context][None]
+        layer_states = standardized.reshape(len(index), layers, per_layer)
+        for layer in range(layers):
+            subspace_cross[context, layer] += layer_states[:, layer].T @ layer_states[:, layer]
+        subspace_count[context] += len(index)
+        normalized = np.tanh(standardized / 3.0).astype(np.float32)
         prototype_candidates[context].append(normalized)
     rng = np.random.default_rng(args.seed)
     normal_prototypes = np.empty((contexts, args.normal_prototype_count, selected_width), dtype=np.float32)
@@ -385,9 +400,15 @@ def main() -> None:
         candidates = np.concatenate(groups_for_context, axis=0)
         choose = rng.choice(len(candidates), size=args.normal_prototype_count, replace=len(candidates) < args.normal_prototype_count)
         normal_prototypes[context] = candidates[choose]
+    normal_subspace_basis = np.empty((contexts, layers, per_layer, args.subspace_rank), dtype=np.float32)
+    for context in range(contexts):
+        for layer in range(layers):
+            covariance = subspace_cross[context, layer] / max(1, subspace_count[context])
+            _values, vectors = np.linalg.eigh(covariance)
+            normal_subspace_basis[context, layer] = vectors[:, -args.subspace_rank:].astype(np.float32)
 
     artifact = {
-        "version": 5,
+        "version": 6,
         "dataset": args.dataset,
         "hidden_layers": layers,
         "hidden_width": width,
@@ -406,6 +427,8 @@ def main() -> None:
         "transition_mean": torch.from_numpy(transition_mean.astype(np.float32)),
         "transition_std": torch.from_numpy(transition_std.astype(np.float32)),
         "normal_prototypes": torch.from_numpy(normal_prototypes),
+        "normal_subspace_basis": torch.from_numpy(normal_subspace_basis),
+        "subspace_rank": args.subspace_rank,
         "ln_post_weight": torch.from_numpy(ln_weight),
         "ln_post_bias": torch.from_numpy(ln_bias),
         "ln_post_eps": ln_eps,
@@ -471,6 +494,7 @@ def main() -> None:
         "context_count": contexts,
         "normal_prototype_count": args.normal_prototype_count,
         "prototype_frames_per_video": args.prototype_frames_per_video,
+        "subspace_rank": args.subspace_rank,
         "selection": "weak bag tail contrast plus signed frozen hidden-to-text semantic directions; no VadCLIP score is used",
         "assets": relpath(asset_path, output),
     })

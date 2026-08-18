@@ -43,10 +43,11 @@ class ChannelRankVerifier(nn.Module):
     """A direct, class-assigned witness circuit over selected CLIP channels.
 
     For selected channel ``k`` and its assigned anomaly text ``c``, the
-    reader measures two non-negative, human-readable quantities:
+    reader measures three non-negative, human-readable quantities:
 
     ``state_excess(t,k) = relu(|h(t,k)-nearest_normal(k)|-threshold_state(k))``
     ``motion_excess(t,k) = relu(|delta_h(t,k)-normal_delta(k)|-threshold_motion(k))``.
+    ``subspace_excess(t,k) = relu(|h(t,k)-projection_normal_subspace(k)|-threshold_subspace(k))``.
 
     Learned gates only choose which *preselected* witnesses remain useful for
     that same text. There is no MLP, no learned visual embedding and no
@@ -74,6 +75,11 @@ class ChannelRankVerifier(nn.Module):
         self.register_buffer("transition_mean", assets["transition_mean"].float())
         self.register_buffer("transition_std", assets["transition_std"].float().clamp_min(1e-6))
         self.register_buffer("normal_prototypes", assets["normal_prototypes"].float())
+        self.register_buffer("normal_subspace_basis", assets["normal_subspace_basis"].float())
+        self.subspace_rank = int(assets["subspace_rank"])
+        if self.width % self.layers != 0:
+            raise ValueError("selected witnesses must have the same count in every hidden layer")
+        self.channels_per_layer = self.width // self.layers
         self.register_buffer("selected_layers", assets["selected_layers"].long())
         self.register_buffer("selected_dimensions", assets["selected_dimensions"].long())
         self.register_buffer("selected_text_direction", assets["selected_text_direction"].float())
@@ -98,12 +104,17 @@ class ChannelRankVerifier(nn.Module):
         initial_gate[active] = float(gate_initial_logit)
         self.state_gate_logits = nn.Parameter(initial_gate)
         self.motion_gate_logits = nn.Parameter(initial_gate.clone())
+        self.subspace_gate_logits = nn.Parameter(initial_gate.clone())
         self.state_threshold_logits = nn.Parameter(torch.full((self.width,), inverse_softplus(0.25)))
         self.motion_threshold_logits = nn.Parameter(torch.full((self.width,), inverse_softplus(0.20)))
+        self.subspace_threshold_logits = nn.Parameter(torch.full((self.width,), inverse_softplus(0.20)))
         self.state_scale_logits = nn.Parameter(
             torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
         )
         self.motion_scale_logits = nn.Parameter(
+            torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
+        )
+        self.subspace_scale_logits = nn.Parameter(
             torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
         )
         self.channel_temperature_logits = nn.Parameter(
@@ -126,7 +137,20 @@ class ChannelRankVerifier(nn.Module):
         context = self._context_indices(last_hidden, mask)
         state_mean, state_std = self.state_mean[context], self.state_std[context]
         transition_mean, transition_std = self.transition_mean[context], self.transition_std[context]
-        normalized_state = torch.tanh((circuit - state_mean.unsqueeze(1)) / (3.0 * state_std.unsqueeze(1)))
+        standardized_state = (circuit - state_mean.unsqueeze(1)) / state_std.unsqueeze(1)
+        normalized_state = torch.tanh(standardized_state / 3.0)
+
+        # ``normal_subspace_basis`` is a fixed, context-specific SVD basis
+        # of only the selected channels.  Reconstruction removes normal
+        # channel co-variation; each residual component is still the original
+        # layer/dimension coordinate that can be shown in an audit.
+        layer_state = standardized_state.view(
+            circuit.shape[0], circuit.shape[1], self.layers, self.channels_per_layer
+        )
+        basis = self.normal_subspace_basis[context]
+        coefficient = torch.einsum("btlp,blpr->btlr", layer_state, basis)
+        reconstruction = torch.einsum("btlr,blpr->btlp", coefficient, basis)
+        subspace_residual = (layer_state - reconstruction).reshape_as(circuit)
 
         # The normal reference is still expressed in the same selected
         # channels. It handles multiple normal camera/pose modes without
@@ -154,6 +178,8 @@ class ChannelRankVerifier(nn.Module):
             "nearest_prototype": nearest_prototype,
             "prototype_residual": prototype_residual,
             "state_deviation": prototype_residual.abs(),
+            "subspace_residual": subspace_residual,
+            "subspace_deviation": torch.tanh(subspace_residual.abs() / 3.0),
             "normalized_transition": normalized_transition,
             "motion_deviation": motion_deviation,
         }
@@ -161,33 +187,45 @@ class ChannelRankVerifier(nn.Module):
     def _channel_evidence(self, deviations: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         state_threshold = F.softplus(self.state_threshold_logits)
         motion_threshold = F.softplus(self.motion_threshold_logits)
+        subspace_threshold = F.softplus(self.subspace_threshold_logits)
         state_excess = F.relu(deviations["state_deviation"] - state_threshold.view(1, 1, -1))
         motion_excess = F.relu(deviations["motion_deviation"] - motion_threshold.view(1, 1, -1))
+        subspace_excess = F.relu(deviations["subspace_deviation"] - subspace_threshold.view(1, 1, -1))
 
         state_gates = torch.sigmoid(self.state_gate_logits) * self.channel_class_mask
         motion_gates = torch.sigmoid(self.motion_gate_logits) * self.channel_class_mask
+        subspace_gates = torch.sigmoid(self.subspace_gate_logits) * self.channel_class_mask
         state_weights = state_gates / state_gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
         motion_weights = motion_gates / motion_gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
+        subspace_weights = subspace_gates / subspace_gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
         state_evidence = torch.einsum("btk,kc->btc", state_excess, state_weights)
         motion_evidence = torch.einsum("btk,kc->btc", motion_excess, motion_weights)
+        subspace_evidence = torch.einsum("btk,kc->btc", subspace_excess, subspace_weights)
         class_evidence = (
             state_evidence * F.softplus(self.state_scale_logits).view(1, 1, -1)
             + motion_evidence * F.softplus(self.motion_scale_logits).view(1, 1, -1)
+            + subspace_evidence * F.softplus(self.subspace_scale_logits).view(1, 1, -1)
         )
         return {
             "state_threshold": state_threshold,
             "motion_threshold": motion_threshold,
+            "subspace_threshold": subspace_threshold,
             "state_excess": state_excess,
             "motion_excess": motion_excess,
+            "subspace_excess": subspace_excess,
             "state_gates": state_gates,
             "motion_gates": motion_gates,
+            "subspace_gates": subspace_gates,
             "state_weights": state_weights,
             "motion_weights": motion_weights,
+            "subspace_weights": subspace_weights,
             "state_evidence": state_evidence,
             "motion_evidence": motion_evidence,
+            "subspace_evidence": subspace_evidence,
             "class_evidence": class_evidence,
             "state_scales": F.softplus(self.state_scale_logits),
             "motion_scales": F.softplus(self.motion_scale_logits),
+            "subspace_scales": F.softplus(self.subspace_scale_logits),
         }
 
     def forward(
@@ -247,8 +285,13 @@ class ChannelRankVerifier(nn.Module):
             result["motion_channel_contribution"] = (
                 atoms["motion_excess"].unsqueeze(-1) * atoms["motion_weights"].view(1, 1, self.width, -1)
             )
+            result["subspace_channel_contribution"] = (
+                atoms["subspace_excess"].unsqueeze(-1) * atoms["subspace_weights"].view(1, 1, self.width, -1)
+            )
             result["channel_contribution"] = (
-                result["state_channel_contribution"] + result["motion_channel_contribution"]
+                result["state_channel_contribution"]
+                + result["motion_channel_contribution"]
+                + result["subspace_channel_contribution"]
             )
         return result
 
@@ -288,7 +331,11 @@ def verifier_loss(
         normal_loss = torch.zeros((), device=class_targets.device)
     difference = (outputs["verified_all"] - outputs["baseline_probability"]).abs().mean(dim=-1)
     preserve = (difference * outputs["mask"].to(difference.dtype)).sum() / outputs["mask"].sum().clamp_min(1)
-    sparsity = 0.5 * (outputs["state_gates"].mean() + outputs["motion_gates"].mean())
+    sparsity = (
+        outputs["state_gates"].mean()
+        + outputs["motion_gates"].mean()
+        + outputs["subspace_gates"].mean()
+    ) / 3.0
     total = (
         bag
         + float(hidden_mil_weight) * witness_bag
