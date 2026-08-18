@@ -81,13 +81,13 @@ def main() -> None:
         "assets": args.assets,
         "model_path": args.model_path,
         "baseline_checkpoint": args.init_baseline_model,
-        "verification": "signed hidden-channel evidence selects keep, suppress, or promote actions over frozen baseline scores",
+        "verification": "hard-selected hidden-channel witness evidence re-ranks frozen baseline anomaly odds",
     })
     final = metrics["rank_verified"]
     print(
         f"baseline AUC2/AP2={metrics['baseline']['auc2']:.6f}/{metrics['baseline']['ap2']:.6f} | "
         f"channel AUC/AP={metrics['channel_evidence_only']['auc']:.6f}/{metrics['channel_evidence_only']['ap']:.6f} | "
-        f"sparse/semantic/memory AP={metrics['sparse_evidence_only']['ap']:.6f}/{metrics['semantic_evidence_only']['ap']:.6f}/{metrics['normal_memory_evidence_only']['ap']:.6f} | "
+        f"selected-channel AP={metrics['channel_evidence_only']['ap']:.6f} | "
         f"verified AUC2/AP2={final['auc2']:.6f}/{final['ap2']:.6f} dMAP={final['detection_map_average']:.2f}%",
         flush=True,
     )

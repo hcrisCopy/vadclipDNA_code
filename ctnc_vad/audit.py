@@ -37,53 +37,37 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
         torch.tensor([length], dtype=torch.int64, device=device),
         return_channel_contribution=True,
     )
-    contribution = outputs["channel_contribution"].abs()
+    contribution = outputs["channel_contribution"]
     count = min(int(topk), contribution.shape[-2])
     values, indices = contribution[0, :length].topk(count, dim=-2)
-    semantic_contribution = outputs["semantic_hidden_contribution"].abs()
-    semantic_count = min(int(topk), semantic_contribution.shape[-2])
-    semantic_values, semantic_indices = semantic_contribution[0, :length].topk(semantic_count, dim=-2)
     return {
         "hidden_anomaly": outputs["hidden_anomaly"][0, :length].cpu().numpy().astype(np.float32),
-        "sparse_hidden_anomaly": outputs["sparse_hidden_anomaly"][0, :length].cpu().numpy().astype(np.float32),
-        "semantic_anomaly": outputs["semantic_anomaly"][0, :length].cpu().numpy().astype(np.float32),
-        "normal_memory_anomaly": outputs["normal_memory_anomaly"][0, :length].cpu().numpy().astype(np.float32),
-        "normal_memory_distance": outputs["normal_memory_distance"][0, :length].cpu().numpy().astype(np.float32),
-        "normal_memory_nearest_similarity": outputs["normal_memory_nearest_similarity"][0, :length].cpu().numpy().astype(np.float32),
-        "normal_memory_nearest_video_index": outputs["normal_memory_nearest_video_index"][0, :length].cpu().numpy().astype(np.int64),
-        "normal_memory_nearest_prototype_index": outputs["normal_memory_nearest_prototype_index"][0, :length].cpu().numpy().astype(np.int64),
+        "channel_probability": outputs["channel_probability"][0, :length].cpu().numpy().astype(np.float32),
         "class_evidence": outputs["class_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "state_evidence": outputs["state_evidence"][0, :length].cpu().numpy().astype(np.float32),
-        "transition_evidence": outputs["transition_evidence"][0, :length].cpu().numpy().astype(np.float32),
+        "motion_evidence": outputs["motion_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "normalized_state": outputs["normalized_state"][0, :length].cpu().numpy().astype(np.float32),
         "nearest_normal_prototype_index": outputs["nearest_prototype_index"][0, :length].cpu().numpy().astype(np.int64),
         "nearest_normal_prototype": outputs["nearest_prototype"][0, :length].cpu().numpy().astype(np.float32),
         "prototype_residual": outputs["prototype_residual"][0, :length].cpu().numpy().astype(np.float32),
+        "state_deviation": outputs["state_deviation"][0, :length].cpu().numpy().astype(np.float32),
+        "state_excess": outputs["state_excess"][0, :length].cpu().numpy().astype(np.float32),
         "normalized_transition": outputs["normalized_transition"][0, :length].cpu().numpy().astype(np.float32),
-        "transition_novelty": outputs["transition_novelty"][0, :length].cpu().numpy().astype(np.float32),
+        "motion_deviation": outputs["motion_deviation"][0, :length].cpu().numpy().astype(np.float32),
+        "motion_excess": outputs["motion_excess"][0, :length].cpu().numpy().astype(np.float32),
         "normal_context": outputs["context"].cpu().numpy().astype(np.int64),
-        "gate": outputs["gates"].cpu().numpy().astype(np.float32),
         "class_gate": outputs["class_gates"].cpu().numpy().astype(np.float32),
-        "transition_gate": outputs["transition_gates"].cpu().numpy().astype(np.float32),
+        "motion_gate": outputs["motion_gates"].cpu().numpy().astype(np.float32),
         "state_weight": outputs["state_weights"].cpu().numpy().astype(np.float32),
-        "transition_weight": outputs["transition_weights"].cpu().numpy().astype(np.float32),
-        "state_correction": outputs["state_correction"].cpu().numpy().astype(np.float32),
+        "motion_weight": outputs["motion_weights"].cpu().numpy().astype(np.float32),
+        "state_threshold": outputs["state_threshold"].cpu().numpy().astype(np.float32),
+        "motion_threshold": outputs["motion_threshold"].cpu().numpy().astype(np.float32),
         "state_scale": outputs["state_scales"].cpu().numpy().astype(np.float32),
-        "transition_scale": outputs["transition_scales"].cpu().numpy().astype(np.float32),
-        "rank_scale": outputs["rank_scales"].cpu().numpy().astype(np.float32),
-        "class_gain": outputs["class_gains"].cpu().numpy().astype(np.float32),
-        "semantic_binary_scale": outputs["semantic_binary_scale"].cpu().numpy().astype(np.float32),
-        "memory_binary_scale": outputs["memory_binary_scale"].cpu().numpy().astype(np.float32),
-        "normal_memory_temperature": outputs["normal_memory_temperature"].cpu().numpy().astype(np.float32),
-        "semantic_probability": outputs["semantic_probability"][0, :length].cpu().numpy().astype(np.float32),
-        "semantic_logit": outputs["semantic_logit"][0, :length].cpu().numpy().astype(np.float32),
-        "semantic_text_weight": outputs["semantic_weights"].cpu().numpy().astype(np.float32),
-        "semantic_projection_norm": outputs["semantic_projection_norm"][0, :length].cpu().numpy().astype(np.float32),
+        "motion_scale": outputs["motion_scales"].cpu().numpy().astype(np.float32),
+        "fusion_scale": outputs["fusion_scale"].cpu().numpy().astype(np.float32),
         "verification_strength": outputs["verification_strength"].reshape(1).cpu().numpy().astype(np.float32),
         "top_circuit_index_by_class": indices.cpu().numpy().astype(np.int64),
         "top_circuit_contribution_by_class": values.cpu().numpy().astype(np.float32),
-        "top_semantic_hidden_index_by_class": semantic_indices.cpu().numpy().astype(np.int64),
-        "top_semantic_hidden_contribution_by_class": semantic_values.cpu().numpy().astype(np.float32),
     }
 
 

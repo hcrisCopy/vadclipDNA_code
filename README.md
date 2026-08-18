@@ -1,115 +1,84 @@
-# CTNC-VAD：用 CLIP hidden 通道重排冻结 VadCLIP
+# CTNC-VAD：用已选 CLIP hidden 通道重排冻结 VadCLIP
 
-本项目当前的正式方案是 **CTNC-VAD（Text-Conditioned Neural Circuit VAD）**。目标不是修改、微调或替换 VadCLIP，而是在其完全冻结的前提下，利用 CLIP 多层 hidden states 中可解释的通道证据，改善最终的异常排序、定位和类别定位。
+CTNC-VAD 的唯一核心是：**从 CLIP 多层 hidden states 中选出少量有文本含义的通道，用这些通道的可解释证据增强冻结 VAD baseline 的异常排序和定位。**
 
-旧的 `xd_dna/` 目录保留为历史代码；正式实验只运行本项目自己的 `ctnc_vad/`，不会跨项目 import 代码。
+它不修改 `VadCLIP/` 中的任何代码、权重或预测头；也不向 encoder 注入 residual。VadCLIP 只提供冻结的类别概率，CTNC 是一个可外挂的 channel-evidence re-ranker。
 
-## 核心想法
-
-现有 VAD 方法通常把 CLIP 当作固定特征提取器，再不断堆叠自己的时序/分类分支。CTNC 的出发点不同：CLIP 的视觉编码器已经在预训练中学到与文本概念相关的内部坐标，而正常视频还提供了“某个场景下该坐标应处于什么状态”的参照。
-
-CTNC 将每个最终分数的变化分解为可检查的链条：
+## 一句话理解方法
 
 ```text
-冻结 VadCLIP 的 prompt 概率 [normal, class_1, ...]
-                    +
-多层 CLIP hidden state [T, 12, 768]
-                    |
-       ┌────────────┴────────────┐
-稀疏正常性电路                 全 final-layer 语义电路
-384 个层-通道-文本原子          768 个 hidden 通道 → 冻结 CLIP visual/text 路径
-正常原型偏离 + 转移惊异          每个异常文本的显式线性方向（有文本先验锚定）
-       └────────────┬────────────┘
-                    |
-每个文本类别各自得到可审计的 hidden evidence
-                    |
-log p_frozen(class) + hidden likelihood factor(class)
-                    |
-softmax 后的类别概率与异常分数（排序/定位）
+冻结 VadCLIP 概率                  已缓存 CLIP hidden states [T, 12, 768]
+         |                                      |
+         |                         只保留硬选择的 12 × 64 个通道
+         |                         每个通道都有 layer / dim / 关联异常文本
+         |                                      |
+         └────────── binary-odds 融合 ← 该通道偏离正常 state / motion 的证据
+                                      |
+                            更好的帧排序与异常片段定位
 ```
 
-这不是 residual 注入：CTNC 不把向量写回 VadCLIP 的编码器、时序模块或分类头。它是一个外挂的 **prediction-space product-of-experts re-ranker**。任何能输出“正常 + 多个异常文本类别”概率的冻结 VAD baseline 都可以接入同一接口；若 baseline 只有二分类输出，也可使用一个异常文本集合的聚合概率作为兼容接口。
+## CTNC 到底在解释什么
 
-## 为什么可解释
+`discover` 先为每个候选 hidden 维度计算两件事：
 
-解释分成两类、互补的证据。稀疏正常性电路中每一个保留通道都有固定元数据：
+1. 它在异常视频的高响应尾部是否显著不同于正常视频；
+2. 经冻结 CLIP 的 `hidden → visual → text` 路径，它与哪一个异常文本最相关、方向是什么。
 
-- CLIP 层号和 hidden 维度；
-- 它经冻结 CLIP `hidden → visual projection → text` 路径与哪一个异常文本最相关；
-- 该通道朝向该文本是正向还是负向；
-- 当前视频最相近的纯正常场景 context；
-- 当前帧匹配到的真实正常 hidden 原型，以及相对该原型的有符号状态偏离；
-- 当前帧相对该 context 的转移惊异度（该通道变化是否不符合正常运动）；
-- 训练后该“通道—文本类别”的 state gate、transition gate、显式语义校正和类别 rank-scale。
+每层为各异常文本均衡地**硬选 64 个维度**。因此 XD 上只使用 `12 × 64 = 768` 个维度，而不是把全部 `12 × 768` hidden 扔进黑箱网络。
 
-因此，对某帧“为什么提高 shooting / explosion 概率”可以直接导出贡献最大的 `layer-dimension-text-direction`，而不是解释黑箱 residual 特征。`ctnc_vad.audit` 会逐视频写出这些证据。
-
-全通道语义电路则复用 CLIP 原始的 `LayerNorm → visual projection → text direction` 路径。它不训练视觉编码器；每个异常文本只学习相对冻结文本方向的小校正，并将任一帧的 semantic logit 分摊回 768 个 final hidden 通道（包含 projection 归一化）。因此既能解释“哪个稀疏通道偏离正常原型”，也能解释“哪些 CLIP 内部维度正在支持 shooting / explosion 这个文本概念”。
-
-此外，CTNC 保存每条真实正常视频的 final CLIP visual prototype。测试视频先按全局 hidden signature 检索最相似的 8 条正常视频，再为每帧检索其中最相近的真实正常帧。这个 **normal-video counterfactual memory** 输出“距离、匹配正常视频编号、匹配正常帧编号”，能解释某帧为何不符合本场景的正常状态；它不是把 baseline 高分帧当作伪正常样本。
-
-## 两个阶段
-
-### 1. `discover`：只做一次、与 baseline 分数无关
-
-输入训练集的 reusable hidden states `[T,12,768]` 和训练集视频标签。
-
-1. 只用纯正常视频聚类 scene context，并为每个 context 估计通道正常均值/标准差和一小组真实正常 hidden 原型；
-2. 用冻结 CLIP 的最终视觉投影和文本编码器，估计各层各维对异常文本的**有符号**影响；
-3. 对每个异常文本分别计算视频级 weak-label hidden tail 统计，再与该文本的 signed semantic affinity 共同排序；每层按文本均衡地选取稀疏通道，避免高频类别占满候选集；
-4. 写出 `channel_scores.csv` 和 `circuit_assets.pt`。
-
-这一阶段不读取、也不阈值化 VadCLIP 的预测，因而没有 baseline 伪正/负样本构造。
-
-### 2. `train`：冻结 baseline 的类别概率重排序
-
-先缓存一次冻结 VadCLIP 的 `prob2_all`，它只是 sidecar 的输入，不构成标签。训练监督是数据集原始**视频级类别标签**：XD 的 `G-B2-B6` 会变成多标签 `[explosion, shooting, car accident]`；正常视频所有异常类为 0。
-
-小型 reader 仅学习：
-
-- 每个已发现的“通道—异常文本”对的 state gate 和 transition gate；
-- 一个受冻结 CLIP 文本方向约束的、显式可导出的 state 校正量；
-- 每个异常文本类别的 state/transition 证据尺度和 rank-scale。
-- 每个异常文本在冻结 CLIP final visual space 的显式方向校正、先验和语义 rank-scale；这条分支覆盖全部 768 个 final hidden 通道。
-- normal-video memory 的距离校准与保守融合尺度；正常视频原型本身完全冻结、来自 discovery 阶段的真实正常帧。
-
-其中 state 是 hidden 相对**最近的真实正常原型**的有符号偏离，transition 是相对正常 context 的局部变化惊异度；两者都是逐帧、逐 `layer-dimension-text` 可分解的线性证据。原型检索避免把同一场景中的不同正常姿态、镜头或运动模式粗暴压成一个均值。读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
+对于测试帧，选中维度 `k` 只产生两种证据：
 
 ```text
-semantic_anomaly = 1 - product_c [1 - semantic_probability(c)]
-logit p_final(anomaly) = logit p_frozen(anomaly)
-                       + semantic_binary_scale × logit semantic_anomaly
-                       + memory_binary_scale × logit normal_memory_anomaly
-p_final(class c | anomaly) = p_frozen(class c | anomaly)
+state excess  = max(0, |当前通道 - 最近正常原型通道| - 学到的正常阈值)
+motion excess = max(0, |当前通道变化 - 正常变化| - 学到的正常阈值)
 ```
 
-这里稀疏正常性电路不再直接给异常帧加分：若它在正常帧上不可靠，只作为可解释的反事实审计而不污染排序。语义电路先判断“异常还是正常”，随后完整保留冻结 baseline 在异常类别之间的条件概率，因而适配任意输出 normal + anomaly classes 的 baseline。最终 `p_final(anomaly)` 用于帧级排序/定位，回填后的 `p_final(all classes)` 用于 detection mAP。损失包含冻结后输出的 MIL、稀疏正常性电路的 direct MIL、全通道语义电路的 direct MIL、正常视频帧约束、很小的冻结输出保持项、双 gate 稀疏项和文本方向锚定项。全通道语义电路必须单独预测视频原始类别，不能只是跟随 baseline。
+每个维度只服务于它在 discovery 时被分配的异常文本；训练仅学习该维度是否保留、两个阈值、文本内的加权和及一个融合尺度。没有 MLP、没有新视觉 embedding、没有 all-hidden 兜底路径。
 
-## 数据与目录约束
-
-从 `vadclipDNA_code` 运行。所有新产物只写到同级：
+所以任意一次分数上升都可追溯为：
 
 ```text
-../vadclipDNA_data/<dataset>_ctnc_vad/
-  discovery/                 # 可复用通道发现资产
+视频 / 帧 → 异常文本 → top-k layer-dimension witness
+          → state 或 motion 超过了什么阈值
+          → 匹配的 normal context / normal prototype
+          → 该 witness 的 gate、权重和最终贡献
+```
+
+这就是论文里的可解释性主体，而不是只展示 attention 图或检索到的相似样本。
+
+## 训练和公平性
+
+- VadCLIP 视觉编码器、文本编码器、时序模块、分类头和 checkpoint 都冻结；
+- hidden 通道发现只用训练集的原始视频级标签、纯正常视频和冻结 CLIP 文本路径；**不读取 baseline 打分，也不由 baseline 构造正负样本**；
+- 训练 reader 仍只用原始视频级标签的 MIL；baseline 概率只作为最终冻结输入，不当伪标签；
+- 最终保持 baseline 在异常类别之间的条件分布，仅在 normal/anomaly odds 上做重排。因此对任何输出“normal + anomaly classes”的 VAD baseline 都可作为外挂使用；
+- `model_best.pth` 只按同一验证集的官方 XD `AP2` 保存。正确的当前 VadCLIP 基线对齐值为约 `0.845045`。
+
+## 目录
+
+从 `vadclipDNA_code` 运行。所有新产物写到同级数据目录：
+
+```text
+../vadclipDNA_data/xd_ctnc_vad/
+  discovery/                 # 选择的通道、正常 context 和正常原型
   baseline_cache/train/      # 一次性冻结 VadCLIP 概率缓存
   training/                  # reader checkpoint/history
-  evaluation/                # 官方指标与逐视频预测
-  audit/<split>/             # 通道级解释
+  evaluation/                # 官方指标和逐视频预测
+  audit/xd_test/             # 每帧的通道级解释
 ```
 
-隐藏状态是数据资产，不是跨项目代码依赖。manifest 中每项应指向 `[T,12,768]` 的 CLS hidden。默认遇到训练 manifest 缺失视频会记录并跳过；测试集缺失则会报错，避免官方 ground truth 对齐失效。
+## XD-Violence：正式命令
 
-## XD-Violence 命令
-
-服务器先进入项目并激活环境：
+服务器环境：
 
 ```bash
 cd ~/autodl-tmp/vadclipDNA_code
 conda activate dsanet
 ```
 
-首次发现通道（已生成有效资产时可跳过）：
+### 1. 发现并固定通道
+
+`--clean` 只重建 `discovery/`。这里显式传入 `64`，保证正式方案选 768 个通道。
 
 ```bash
 python -m ctnc_vad.discover \
@@ -119,22 +88,26 @@ python -m ctnc_vad.discover \
   --hidden-path-base . \
   --output-root ../vadclipDNA_data/xd_ctnc_vad \
   --clip-model ViT-B/16 \
-  --candidate-per-layer 32 \
+  --candidate-per-layer 64 \
   --context-count 16 \
   --context-iters 50 \
   --normal-prototype-count 64 \
   --prototype-frames-per-video 32 \
-  --normal-video-neighbor-count 8 \
   --frames-per-video 128 \
   --tail-fraction 0.125 \
   --semantic-weight 0.5 \
   --ridge 0.001 \
   --std-floor 0.0001 \
   --seed 234 \
-  --device cuda
+  --device cuda \
+  --clean
 ```
 
-训练 sidecar（`--clean` 只删除 `../vadclipDNA_data/xd_ctnc_vad/training/`，不会动 baseline 或 discovery）：
+重点产物：`discovery/channel_scores.csv` 是全部维度的筛选分数，`discovery/channel_text_scores.csv` 是每个维度与各异常文本的关系，`circuit_assets.pt` 是正式 reader 的固定输入。
+
+### 2. 训练冻结 baseline 的通道重排器
+
+`--clean` 只删除 `training/`，不会动 discovery 和 baseline cache。中断后删除 `--clean`，添加 `--resume` 即可继续。
 
 ```bash
 python -m ctnc_vad.train \
@@ -154,12 +127,11 @@ python -m ctnc_vad.train \
   --max-epoch 10 \
   --batch-size 96 \
   --lr 0.001 \
-  --semantic-lr 0.01 \
+  --reader-lr 0.001 \
   --scheduler-milestones 6 9 \
   --normal-frame-weight 0.25 \
   --preserve-weight 0.01 \
   --sparsity-weight 0.001 \
-  --semantic-anchor-weight 0.05 \
   --hidden-mil-weight 1.0 \
   --verification-initial-logit -3.0 \
   --alignment crop_hidden \
@@ -168,46 +140,9 @@ python -m ctnc_vad.train \
   --clean
 ```
 
-如果 discovery 从旧版本升级到包含 normal-video memory 的版本，可以复用旧 reader 的**兼容参数**，但要使用一个新的输出根目录，避免 `--clean` 删除初始化 checkpoint。例如下面只初始化旧的语义/稀疏 reader；新的正常视频记忆、优化器和 history 都从头开始：
+每 epoch 打印：`baseline AP2`、`selected-channel AP`、最终 `AP2` 和 detection mAP。只有最终 AP2 超过 `0.845045` 才算实际提升；selected-channel AP 用于判断通道证据本身是否足以改善定位。
 
-```bash
-python -m ctnc_vad.train \
-  --dataset xd \
-  --source-train-csv ../vad_data/work_xd/xd_train_local.csv \
-  --source-test-csv ../vad_data/work_xd/xd_test_local.csv \
-  --source-path-base . \
-  --train-hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_train_8gpu/manifest.csv \
-  --test-hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_test_8gpu/manifest.csv \
-  --hidden-path-base . \
-  --assets ../vadclipDNA_data/xd_ctnc_vad/discovery/circuit_assets.pt \
-  --init-baseline-model ../vadclip_data/model/vadclip_xd.pth \
-  --init-verifier ../vadclipDNA_data/xd_ctnc_vad/training/model_best.pth \
-  --output-root ../vadclipDNA_data/xd_ctnc_memory_vad \
-  --gt-path VadCLIP/list/gt.npy \
-  --gt-segment-path VadCLIP/list/gt_segment.npy \
-  --gt-label-path VadCLIP/list/gt_label.npy \
-  --max-epoch 10 \
-  --batch-size 96 \
-  --lr 0.001 \
-  --semantic-lr 0.01 \
-  --scheduler-milestones 6 9 \
-  --normal-frame-weight 0.25 \
-  --preserve-weight 0.01 \
-  --sparsity-weight 0.001 \
-  --semantic-anchor-weight 0.05 \
-  --hidden-mil-weight 1.0 \
-  --verification-initial-logit -3.0 \
-  --alignment crop_hidden \
-  --seed 234 \
-  --device cuda \
-  --clean
-```
-
-这个初始化不是恢复训练：若进程中断，请对新输出根目录使用 `--resume`，不要同时再传 `--init-verifier`。
-
-每 epoch 会同时打印冻结 baseline 的官方 `AP2` 与 CTNC 后的 `AP2`，并分别打印稀疏正常性电路和全通道语义电路的 hidden-only AP。两者的联合分数不能代替单分支 AP：若某一分支在正常帧有系统性误报，应在后续局部重排中抑制它，而不是用“取最大值”掩盖问题。XD 当前正确的基线对齐值应为约 `0.845045`；这是保护评测序列顺序后的结果。最优 checkpoint 只按同一验证集上的官方 `AP2` 保存。
-
-测试最优 checkpoint：
+### 3. 测试最优模型
 
 ```bash
 python -m ctnc_vad.test \
@@ -227,7 +162,7 @@ python -m ctnc_vad.test \
   --clean
 ```
 
-导出解释：
+### 4. 导出逐通道解释
 
 ```bash
 python -m ctnc_vad.audit \
@@ -241,15 +176,8 @@ python -m ctnc_vad.audit \
   --output-root ../vadclipDNA_data/xd_ctnc_vad \
   --split-name xd_test \
   --topk 8 \
-  --device cuda
+  --device cuda \
+  --clean
 ```
 
-`audit/xd_test/circuit_dimensions.csv` 是稀疏通道字典；每个视频 `.npz` 还包含每帧的 `semantic_probability`，以及 `top_semantic_hidden_index_by_class` / `top_semantic_hidden_contribution_by_class`：它们直接给出全 final hidden 通道中支持各异常文本的维度及数值。`normal_memory_nearest_video_index`、`normal_memory_nearest_prototype_index` 和 `normal_memory_distance` 给出真实正常反事实。`evaluation/predictions/*.npz` 会分别保存联合、稀疏、语义和 normal-memory evidence，用于检查是哪一条可解释证据真正改善了定位。
-
-## 评测公平性与开销
-
-- VadCLIP checkpoint、视觉编码器、文本编码器、时序模块、分类头全部冻结；
-- 不用 baseline 打分构建 hidden 通道的正负样本，也不以 baseline 分数作为训练标签；
-- train/test 均保持 source CSV 原视频顺序，避免 `gt.npy` 错位；
-- discovery 使用已有 hidden states，通常只需一次；训练阶段缓存冻结 baseline 一次后，reader 每 epoch 只处理 `[256, 384]` 稀疏通道和 `[256, 7]` 类别概率，远小于重新运行完整 VadCLIP；
-- `evaluation/metrics.json` 给出 baseline、纯 hidden 通道和最终重排序的同协议指标，方便确认提升来自 CTNC 而不是评测变化。
+每个 `audit/xd_test/*.npz` 都包含 `top_circuit_index_by_class` 和 `top_circuit_contribution_by_class`，再通过同文件的 `selected_layers`、`selected_dimensions`、`selected_text_class` 可恢复具体通道。`state_excess`、`motion_excess`、阈值、gate 和 normal prototype index 说明该通道为什么在该帧贡献高。

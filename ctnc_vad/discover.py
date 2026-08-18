@@ -161,7 +161,10 @@ def main() -> None:
     parser.add_argument("--hidden-prefix-to", default="")
     parser.add_argument("--output-root", default="", help="Defaults to ../vadclipDNA_data/<dataset>_ctnc_vad.")
     parser.add_argument("--clip-model", default="ViT-B/16")
-    parser.add_argument("--candidate-per-layer", type=int, default=32)
+    parser.add_argument(
+        "--candidate-per-layer", type=int, default=64,
+        help="Hard-selected text-grounded hidden witnesses retained per CLIP layer.",
+    )
     parser.add_argument("--context-count", type=int, default=16)
     parser.add_argument("--context-iters", type=int, default=50)
     parser.add_argument(
@@ -171,10 +174,6 @@ def main() -> None:
     parser.add_argument(
         "--prototype-frames-per-video", type=int, default=32,
         help="Uniform normal frames contributed by each video to the context prototype bank.",
-    )
-    parser.add_argument(
-        "--normal-video-neighbor-count", type=int, default=8,
-        help="Nearest real normal videos used by the full-hidden counterfactual memory at test time.",
     )
     parser.add_argument("--frames-per-video", type=int, default=128, help="Maximum cached frames per video used for semantic-lens fitting.")
     parser.add_argument("--tail-fraction", type=float, default=0.125, help="Bag-level upper-tail fraction; never uses a baseline score.")
@@ -195,7 +194,7 @@ def main() -> None:
         parser.error("--tail-fraction must be in (0,1] and --semantic-weight must be in [0,1]")
     if min(
         args.candidate_per_layer, args.context_count, args.frames_per_video, args.context_iters,
-        args.normal_prototype_count, args.prototype_frames_per_video, args.normal_video_neighbor_count,
+        args.normal_prototype_count, args.prototype_frames_per_video,
     ) <= 0:
         parser.error("candidate/context/prototype/frame counts and context iterations must be positive")
     if args.std_floor <= 0 or args.ridge < 0:
@@ -207,8 +206,11 @@ def main() -> None:
     output = stage_dir(output_root, "discovery", clean=args.clean)
     asset_path = output / "circuit_assets.pt"
     if asset_path.is_file() and not args.no_resume:
-        print(f"reuse {asset_path}; pass --no-resume or --clean to rebuild discovery", flush=True)
-        return
+        old = torch.load(asset_path, map_location="cpu", weights_only=False)
+        if isinstance(old, dict) and int(old.get("version", -1)) == 5:
+            print(f"reuse {asset_path}; pass --no-resume or --clean to rebuild discovery", flush=True)
+            return
+        print(f"rebuild {asset_path}: old discovery version is incompatible with channel witnesses", flush=True)
 
     groups = grouped_source_rows(read_source_csv(args.source_train_csv))
     hidden_by_key = hidden_manifest_paths(
@@ -368,10 +370,6 @@ def main() -> None:
     # retrieves the closest member of this bank, making the counterfactual
     # "this frame versus this normal state" explicit and inspectable.
     prototype_candidates: list[list[np.ndarray]] = [[] for _ in range(contexts)]
-    # A scene context can contain several normal cameras or activity modes.
-    # Retaining sampled full visual states per *normal video* lets the reader
-    # retrieve a fine-grained counterfactual instead of only a context mean.
-    normal_video_visual_prototypes: list[np.ndarray] = []
     for key, _label, path in tqdm(normal_rows, desc="build normal prototype banks", unit="video"):
         hidden = load_hidden(path)
         context = context_of_normal[key]
@@ -381,10 +379,6 @@ def main() -> None:
             (chosen[index] - state_mean[context][None]) / (3.0 * state_std[context][None])
         ).astype(np.float32)
         prototype_candidates[context].append(normalized)
-        visual = project_last_hidden(hidden[index, -1, :], ln_weight, ln_bias, ln_eps, projection).astype(np.float32)
-        if len(visual) < args.prototype_frames_per_video:
-            visual = visual[np.arange(args.prototype_frames_per_video) % len(visual)]
-        normal_video_visual_prototypes.append(visual)
     rng = np.random.default_rng(args.seed)
     normal_prototypes = np.empty((contexts, args.normal_prototype_count, selected_width), dtype=np.float32)
     for context, groups_for_context in enumerate(prototype_candidates):
@@ -412,9 +406,6 @@ def main() -> None:
         "transition_mean": torch.from_numpy(transition_mean.astype(np.float32)),
         "transition_std": torch.from_numpy(transition_std.astype(np.float32)),
         "normal_prototypes": torch.from_numpy(normal_prototypes),
-        "normal_video_signatures": torch.from_numpy(np.stack(signatures).astype(np.float32)),
-        "normal_video_visual_prototypes": torch.from_numpy(np.stack(normal_video_visual_prototypes)),
-        "normal_video_neighbor_count": int(min(args.normal_video_neighbor_count, len(normal_rows))),
         "ln_post_weight": torch.from_numpy(ln_weight),
         "ln_post_bias": torch.from_numpy(ln_bias),
         "ln_post_eps": ln_eps,
@@ -480,7 +471,6 @@ def main() -> None:
         "context_count": contexts,
         "normal_prototype_count": args.normal_prototype_count,
         "prototype_frames_per_video": args.prototype_frames_per_video,
-        "normal_video_neighbor_count": int(min(args.normal_video_neighbor_count, len(normal_rows))),
         "selection": "weak bag tail contrast plus signed frozen hidden-to-text semantic directions; no VadCLIP score is used",
         "assets": relpath(asset_path, output),
     })

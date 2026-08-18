@@ -18,7 +18,6 @@ from .common import (
     atomic_torch_save,
     default_output_root,
     hidden_manifest_paths,
-    load_json,
     save_json,
     set_seed,
     stage_dir,
@@ -42,21 +41,6 @@ def checkpoint_state(path: Path) -> dict:
     return content
 
 
-def verifier_state(path: Path) -> dict[str, torch.Tensor]:
-    """Read either ``model_best.pth`` or a resumable training checkpoint.
-
-    Initializing from an earlier reader is intentionally different from
-    ``--resume``: it imports only compatible reader weights, never an
-    optimizer state or an old discovery memory.
-    """
-    content = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(content, dict) and "model_state_dict" in content:
-        content = content["model_state_dict"]
-    if not isinstance(content, dict) or not all(isinstance(value, torch.Tensor) for value in content.values()):
-        raise ValueError(f"{path}: expected a CTNC model state dictionary or training checkpoint")
-    return content
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the CTNC text-conditioned channel verifier with frozen VadCLIP evaluation.")
     parser.add_argument("--dataset", choices=["xd", "ucf"], required=True)
@@ -70,10 +54,6 @@ def main() -> None:
     parser.add_argument("--hidden-prefix-to", default="")
     parser.add_argument("--assets", required=True, help="discovery/circuit_assets.pt")
     parser.add_argument("--init-baseline-model", required=True, help="Unmodified VadCLIP checkpoint; it remains frozen.")
-    parser.add_argument(
-        "--init-verifier", default="",
-        help="Optional earlier CTNC model_best.pth. Loads only compatible reader weights; starts a fresh optimizer and training history.",
-    )
     parser.add_argument("--output-root", default="")
     parser.add_argument("--gt-path", required=True)
     parser.add_argument("--gt-segment-path", required=True)
@@ -82,8 +62,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument(
-        "--semantic-lr", type=float, default=None,
-        help="Learning rate only for the new all-channel text reader; defaults to 10x --lr because it starts from a frozen text direction.",
+        "--reader-lr", type=float, default=None,
+        help="Learning rate for the selected-channel witness gates, thresholds and fusion scale; defaults to --lr.",
     )
     parser.add_argument("--scheduler-milestones", type=int, nargs="+", default=None)
     parser.add_argument("--scheduler-rate", type=float, default=0.1)
@@ -92,17 +72,13 @@ def main() -> None:
     parser.add_argument("--preserve-weight", type=float, default=0.01, help="Keep uncertain outputs close to the frozen baseline.")
     parser.add_argument("--sparsity-weight", type=float, default=1e-3)
     parser.add_argument(
-        "--semantic-anchor-weight", type=float, default=0.05,
-        help="Keep state and all-channel text-direction corrections near their frozen CLIP priors.",
-    )
-    parser.add_argument(
         "--hidden-mil-weight", type=float, default=1.0,
-        help="Video-label MIL supervision for both sparse and all-channel hidden circuits.",
+        help="Video-label MIL supervision for the selected-channel witness circuit.",
     )
     parser.add_argument("--gate-initial-logit", type=float, default=0.0)
     parser.add_argument(
         "--verification-initial-logit", type=float, default=-3.0,
-        help="Initial sparse-circuit likelihood scale after sigmoid; -3 starts at about 0.05.",
+        help="Initial channel-witness fusion scale after sigmoid; -3 starts at about 0.05.",
     )
     parser.add_argument("--alignment", choices=["strict", "crop_hidden", "pad_hidden"], default="crop_hidden")
     parser.add_argument("--seed", type=int, default=234)
@@ -118,13 +94,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.clean and args.resume:
         raise ValueError("--clean and --resume cannot be used together")
-    if args.init_verifier and args.resume:
-        raise ValueError("--init-verifier starts fresh training and cannot be combined with --resume")
     if args.max_epoch <= 0 or args.num_workers < 0 or args.scheduler_rate <= 0:
         parser.error("epochs and scheduler rate must be positive; workers may be zero")
     if min(
         args.normal_frame_weight, args.preserve_weight, args.sparsity_weight,
-        args.hidden_mil_weight, args.semantic_anchor_weight,
+        args.hidden_mil_weight,
     ) < 0:
         parser.error("loss weights must be non-negative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -134,8 +108,8 @@ def main() -> None:
     args.batch_size = default_batch if args.batch_size is None else args.batch_size
     args.lr = default_lr if args.lr is None else args.lr
     args.scheduler_milestones = default_milestones if args.scheduler_milestones is None else args.scheduler_milestones
-    args.semantic_lr = (10.0 * args.lr) if args.semantic_lr is None else args.semantic_lr
-    if args.batch_size <= 0 or args.lr <= 0 or args.semantic_lr <= 0:
+    args.reader_lr = args.lr if args.reader_lr is None else args.reader_lr
+    if args.batch_size <= 0 or args.lr <= 0 or args.reader_lr <= 0:
         parser.error("batch size and learning rates must be positive")
 
     output_root = args.output_root or str(default_output_root(args.dataset))
@@ -186,33 +160,7 @@ def main() -> None:
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda"
     )
     model = ChannelRankVerifier(assets, args.gate_initial_logit, args.verification_initial_logit).to(device)
-    if args.init_verifier:
-        init_path = Path(args.init_verifier)
-        if not init_path.is_file():
-            raise FileNotFoundError(f"--init-verifier is absent: {init_path}")
-        load_verifier_state(model, verifier_state(init_path), reader_only=True)
-        print(
-            f"initialized compatible reader weights from {init_path}; "
-            "optimizer and normal-video memory start fresh",
-            flush=True,
-        )
-    # The full semantic reader begins exactly at frozen CLIP text directions.
-    # Its few correction/calibration parameters need to move faster than the
-    # sparse gates; this does not change VadCLIP or its optimizer at all.
-    semantic_parameters = [
-        model.semantic_correction,
-        model.semantic_bias,
-        model.semantic_binary_scale_logits,
-        model.memory_temperature_logits,
-        model.memory_bias,
-        model.memory_binary_scale_logits,
-    ]
-    semantic_ids = {id(parameter) for parameter in semantic_parameters}
-    circuit_parameters = [parameter for parameter in model.parameters() if id(parameter) not in semantic_ids]
-    optimizer = torch.optim.AdamW([
-        {"params": circuit_parameters, "lr": args.lr},
-        {"params": semantic_parameters, "lr": args.semantic_lr},
-    ])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.reader_lr)
     scheduler = MultiStepLR(optimizer, args.scheduler_milestones, args.scheduler_rate)
     gt = np.load(args.gt_path)
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
@@ -233,10 +181,8 @@ def main() -> None:
     for epoch in range(start_epoch, args.max_epoch):
         model.train()
         totals = {
-            "loss": 0.0, "bag": 0.0, "hidden_bag": 0.0, "normal": 0.0,
-            "semantic_bag": 0.0, "semantic_normal": 0.0,
-            "memory_bag": 0.0, "memory_normal": 0.0,
-            "preserve": 0.0, "sparse": 0.0, "semantic_anchor": 0.0,
+            "loss": 0.0, "bag": 0.0, "witness_bag": 0.0, "normal": 0.0,
+            "preserve": 0.0, "sparsity": 0.0,
         }
         batches = 0
         progress = tqdm(train_loader, desc=f"CTNC train {epoch + 1}/{args.max_epoch}", unit="batch")
@@ -255,7 +201,6 @@ def main() -> None:
                 args.preserve_weight,
                 args.sparsity_weight,
                 args.hidden_mil_weight,
-                args.semantic_anchor_weight,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -263,8 +208,7 @@ def main() -> None:
             batches += 1
             totals["loss"] += float(loss.detach())
             for name in (
-                "bag", "hidden_bag", "semantic_bag", "memory_bag", "normal", "semantic_normal", "memory_normal",
-                "preserve", "sparse", "semantic_anchor",
+                "bag", "witness_bag", "normal", "preserve", "sparsity",
             ):
                 totals[name] += pieces[name]
             progress.set_postfix(
@@ -290,21 +234,13 @@ def main() -> None:
             "epoch": epoch + 1,
             "loss": totals["loss"] / max(1, batches),
             "bag_loss": totals["bag"] / max(1, batches),
-            "hidden_bag_loss": totals["hidden_bag"] / max(1, batches),
-            "semantic_bag_loss": totals["semantic_bag"] / max(1, batches),
-            "memory_bag_loss": totals["memory_bag"] / max(1, batches),
+            "witness_bag_loss": totals["witness_bag"] / max(1, batches),
             "normal_loss": totals["normal"] / max(1, batches),
-            "semantic_normal_loss": totals["semantic_normal"] / max(1, batches),
-            "memory_normal_loss": totals["memory_normal"] / max(1, batches),
             "preserve_loss": totals["preserve"] / max(1, batches),
-            "gate_mean": totals["sparse"] / max(1, batches),
-            "semantic_anchor_loss": totals["semantic_anchor"] / max(1, batches),
+            "gate_mean": totals["sparsity"] / max(1, batches),
             "baseline_ap2": float(validation["baseline"]["ap2"]),
             "evidence_auc": float(validation["channel_evidence_only"]["auc"]),
-            "evidence_ap": float(validation["channel_evidence_only"]["ap"]),
-            "sparse_evidence_ap": float(validation["sparse_evidence_only"]["ap"]),
-            "semantic_evidence_ap": float(validation["semantic_evidence_only"]["ap"]),
-            "normal_memory_evidence_ap": float(validation["normal_memory_evidence_only"]["ap"]),
+            "channel_evidence_ap": float(validation["channel_evidence_only"]["ap"]),
             "final_auc": float(final_metrics["auc2"]),
             "final_ap": float(final_metrics[selection_name]),
             "final_dmap": float(final_metrics["detection_map_average"]),
@@ -327,8 +263,7 @@ def main() -> None:
         save_json(output / "validation_last.json", validation)
         print(
             f"epoch {epoch + 1}/{args.max_epoch} | loss={row['loss']:.5f} | "
-            f"baseline AP2={row['baseline_ap2']:.6f} | hidden-only AUC/AP={row['evidence_auc']:.6f}/{row['evidence_ap']:.6f} | "
-            f"sparse/semantic/memory AP={row['sparse_evidence_ap']:.6f}/{row['semantic_evidence_ap']:.6f}/{row['normal_memory_evidence_ap']:.6f} | "
+            f"baseline AP2={row['baseline_ap2']:.6f} | selected-channel AUC/AP={row['evidence_auc']:.6f}/{row['channel_evidence_ap']:.6f} | "
             f"final AUC={row['final_auc']:.6f} {selection_name}={row['final_ap']:.6f} dMAP={row['final_dmap']:.2f}% | "
             f"best={best_metric:.6f}",
             flush=True,

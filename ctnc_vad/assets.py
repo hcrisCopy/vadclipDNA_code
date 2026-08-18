@@ -10,7 +10,6 @@ REQUIRED_KEYS = {
     "version", "dataset", "hidden_layers", "hidden_width", "selected_layers", "selected_dimensions",
     "selected_text_direction", "selected_text_class", "selected_text_affinity",
     "context_centers", "state_mean", "state_std", "transition_mean", "transition_std", "normal_prototypes",
-    "normal_video_signatures", "normal_video_visual_prototypes", "normal_video_neighbor_count",
     "ln_post_weight", "ln_post_bias", "ln_post_eps", "visual_projection", "text_features",
 }
 
@@ -49,16 +48,6 @@ def load_assets(path: str | Path, device: torch.device | str = "cpu") -> dict:
         or prototypes.shape[2] != selected_width
     ):
         raise ValueError(f"{path}: normal_prototypes must have shape [contexts,prototypes,{selected_width}]")
-    signatures = artifact["normal_video_signatures"]
-    visual_prototypes = artifact["normal_video_visual_prototypes"]
-    neighbor_count = int(artifact["normal_video_neighbor_count"])
-    if (
-        not isinstance(signatures, torch.Tensor) or signatures.ndim != 2 or signatures.shape[1] != 768
-        or not isinstance(visual_prototypes, torch.Tensor) or visual_prototypes.ndim != 3
-        or visual_prototypes.shape[0] != signatures.shape[0] or visual_prototypes.shape[2] != 512
-        or neighbor_count <= 0 or neighbor_count > signatures.shape[0]
-    ):
-        raise ValueError(f"{path}: invalid normal-video visual counterfactual memory")
     return artifact
 
 
