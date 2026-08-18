@@ -19,9 +19,8 @@ python -m xd_dna.dsanet_transfer.build_features \
   --split train \
   --source-list ../vad_data/work_xd/xd_train_local.csv \
   --source-path-base . \
-  --dsanet-fdu-manifest ../DSANet_DNA/outputs/xd/fdu_features/train/aligned_features.csv \
-  --fdu-path-base . \
-  --fdu-dir ../DSANet_DNA/outputs/xd/fdu_features/train/features \
+  --dsanet-fdu-manifest ../DSANet_DNA/outputs/xd/fdu_features_from_hidden/train/aligned_features.csv \
+  --fdu-path-base ../DSANet_DNA \
   --neuron-contract ../vadclipDNA_data/xd_dsanet_neuron_transfer/contract/dsanet_transfer_neurons.json \
   --output-root ../vadclipDNA_data/xd_dsanet_neuron_transfer \
   --normal-label A \
@@ -31,9 +30,8 @@ python -m xd_dna.dsanet_transfer.build_features \
   --split test \
   --source-list ../vad_data/work_xd/xd_test_local.csv \
   --source-path-base . \
-  --dsanet-fdu-manifest ../DSANet_DNA/outputs/xd/fdu_features/test/aligned_features.csv \
-  --fdu-path-base . \
-  --fdu-dir ../DSANet_DNA/outputs/xd/fdu_features/test/features \
+  --dsanet-fdu-manifest ../DSANet_DNA/outputs/xd/fdu_features_from_hidden/test/aligned_features.csv \
+  --fdu-path-base ../DSANet_DNA \
   --neuron-contract ../vadclipDNA_data/xd_dsanet_neuron_transfer/contract/dsanet_transfer_neurons.json \
   --output-root ../vadclipDNA_data/xd_dsanet_neuron_transfer \
   --normal-label A

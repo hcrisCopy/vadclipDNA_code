@@ -19,6 +19,7 @@ from .common import (
     FDURecord,
     default_output_root,
     feature_file_signature,
+    infer_dsanet_project_root,
     load_fdu_feature,
     load_transfer_contract,
     match_records,
@@ -249,9 +250,12 @@ def main() -> None:
     parser.add_argument("--source-path-base", default=".", help="Base for relative paths in --source-list.")
     parser.add_argument("--clip-prefix-from", default="", help="Optional stale source-feature prefix.")
     parser.add_argument("--clip-prefix-to", default="", help="Replacement for --clip-prefix-from.")
-    parser.add_argument("--dsanet-fdu-manifest", required=True, help="DSANet fdu_features/<split>/aligned_features.csv.")
-    parser.add_argument("--fdu-path-base", default=".", help="Base for relative fdu_path entries in the DSANet manifest.")
-    parser.add_argument("--fdu-dir", default="", help="Optional DSANet fdu_features/<split>/features override.")
+    parser.add_argument("--dsanet-fdu-manifest", required=True, help="DSANet fdu_features_from_hidden/<split>/aligned_features.csv.")
+    parser.add_argument(
+        "--fdu-path-base", default="",
+        help="Base for relative fdu_path entries; defaults to the inferred DSANet project root.",
+    )
+    parser.add_argument("--fdu-dir", default="", help="Optional DSANet fdu_features_from_hidden/<split>/features override.")
     parser.add_argument("--fdu-prefix-from", default="", help="Optional stale DSANet FDU prefix.")
     parser.add_argument("--fdu-prefix-to", default="", help="Replacement for --fdu-prefix-from.")
     parser.add_argument("--neuron-contract", required=True, help="contract/dsanet_transfer_neurons.json from prepare.py.")
@@ -284,8 +288,9 @@ def main() -> None:
     fdu_validation = validate_dsanet_export_spec(fdu_manifest, contract)
     width, input_width = int(contract["neuron_width"]), int(contract["input_width"])
     source = read_vadclip_list(source_list)
+    fdu_path_base = Path(args.fdu_path_base).resolve() if args.fdu_path_base else infer_dsanet_project_root(fdu_manifest)
     fdu_by_variant = read_dsanet_manifest(
-        fdu_manifest, args.fdu_path_base, args.fdu_dir, args.fdu_prefix_from, args.fdu_prefix_to,
+        fdu_manifest, fdu_path_base, args.fdu_dir, args.fdu_prefix_from, args.fdu_prefix_to,
     )
     _matched, missing_manifest = match_records(source, fdu_by_variant)
     items: list[tuple[object, FDURecord]] = []

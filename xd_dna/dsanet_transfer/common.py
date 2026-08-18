@@ -239,6 +239,17 @@ def read_vadclip_list(path: str | Path) -> pd.DataFrame:
     return frame
 
 
+def infer_dsanet_project_root(manifest_path: str | Path) -> Path:
+    """Infer the DSANet project root from its standard outputs/<dataset>/ layout."""
+    manifest = Path(manifest_path).resolve()
+    for parent in manifest.parents:
+        if parent.name == "outputs":
+            return parent.parent
+    raise ValueError(
+        f"{manifest}: cannot infer the DSANet project root; pass --fdu-path-base explicitly"
+    )
+
+
 def read_dsanet_manifest(
     manifest_path: str | Path,
     fdu_path_base: str | Path,
