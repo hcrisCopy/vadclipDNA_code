@@ -171,6 +171,34 @@ def labels_for_dataset(dataset: str) -> dict[str, str]:
     raise ValueError(f"unsupported dataset={dataset!r}")
 
 
+def video_label_vector(dataset: str, label: str) -> np.ndarray:
+    """Return the official video-level multi-class target in prompt order.
+
+    XD labels may contain multiple anomaly types (for example ``G-B2-B6``).
+    This is supervision supplied by the dataset, not a label inferred from a
+    VAD baseline prediction.
+    """
+    names = list(labels_for_dataset(dataset))
+    result = np.zeros(len(names), dtype=np.float32)
+    value = str(label).strip()
+    if dataset == "xd":
+        parts = value.split("-")
+        if parts and parts[0] == "A":
+            result[0] = 1.0
+        else:
+            for part in parts:
+                if part in names:
+                    result[names.index(part)] = 1.0
+    elif dataset == "ucf":
+        if value in names:
+            result[names.index(value)] = 1.0
+    else:
+        raise ValueError(f"unsupported dataset={dataset!r}")
+    if not result.any():
+        raise ValueError(f"{dataset}: cannot map video label {label!r} to a prompt target")
+    return result
+
+
 def read_source_csv(path: str | Path) -> pd.DataFrame:
     csv_path = Path(path)
     frame = pd.read_csv(csv_path)

@@ -9,7 +9,6 @@ from tqdm import tqdm
 
 from .baseline import score_sequence
 from .circuit import ChannelRankVerifier
-from .circuit import rectified_class_probabilities
 from .common import atomic_save_npz, write_csv
 from .metrics import metrics_from_predictions, score_only_metrics
 
@@ -20,7 +19,10 @@ def valid_prediction(path: Path, length: int) -> bool:
     try:
         artifact = np.load(path, allow_pickle=False)
         try:
-            return all(name in artifact.files and len(artifact[name]) == length for name in ("prob1", "prob2", "evidence", "verified", "prob2_all", "verified_all"))
+            return all(
+                name in artifact.files and len(artifact[name]) == length
+                for name in ("prob1", "prob2", "evidence", "verified", "prob2_all", "verified_all", "class_evidence")
+            )
         finally:
             artifact.close()
     except Exception:
@@ -32,26 +34,28 @@ def verifier_sequence(
     model: ChannelRankVerifier,
     circuit: torch.Tensor,
     last_hidden: torch.Tensor,
-    baseline_score: np.ndarray,
+    baseline_probability: np.ndarray,
     device: torch.device,
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     length = len(circuit)
     outputs = model(
         circuit.unsqueeze(0).to(device),
         last_hidden.unsqueeze(0).to(device),
-        torch.from_numpy(baseline_score).unsqueeze(0).to(device),
+        torch.from_numpy(baseline_probability).unsqueeze(0).to(device),
         torch.tensor([length], dtype=torch.int64, device=device),
     )
     detail = {
         "context": outputs["context"].detach().cpu().numpy().astype(np.int64),
-        "signed_evidence": outputs["signed_evidence"][0, :length].detach().cpu().numpy().astype(np.float32),
-        "agreement": outputs["agreement"][0, :length].detach().cpu().numpy().astype(np.float32),
-        "text_margin": outputs["text_margin"][0, :length].detach().cpu().numpy().astype(np.float32),
-        "keep": outputs["keep"][0, :length].detach().cpu().numpy().astype(np.float32),
-        "suppress": outputs["suppress"][0, :length].detach().cpu().numpy().astype(np.float32),
-        "promote": outputs["promote"][0, :length].detach().cpu().numpy().astype(np.float32),
+        "hidden_anomaly": outputs["hidden_anomaly"][0, :length].detach().cpu().numpy().astype(np.float32),
+        "class_evidence": outputs["class_evidence"][0, :length].detach().cpu().numpy().astype(np.float32),
+        "class_gains": outputs["class_gains"].detach().cpu().numpy().astype(np.float32),
+        "verification_strength": outputs["verification_strength"].reshape(1).detach().cpu().numpy().astype(np.float32),
     }
-    return outputs["score"][0, :length].detach().cpu().numpy().astype(np.float32), detail
+    return (
+        outputs["score"][0, :length].detach().cpu().numpy().astype(np.float32),
+        outputs["verified_all"][0, :length].detach().cpu().numpy().astype(np.float32),
+        detail,
+    )
 
 
 def collect_predictions(
@@ -90,16 +94,16 @@ def collect_predictions(
             probability1, probability2, probability2_all = score_sequence(
                 baseline_model, feature, visual_length, dataset_name, device
             )
-            verified, detail = verifier_sequence(
-                circuit_model, item["circuit"], item["last_hidden"], probability2, device
+            verified, verified_all, detail = verifier_sequence(
+                circuit_model, item["circuit"], item["last_hidden"], probability2_all, device
             )
             result = {
                 "prob1": probability1,
                 "prob2": probability2,
                 "prob2_all": probability2_all,
-                "evidence": detail["signed_evidence"],
+                "evidence": detail["hidden_anomaly"],
                 "verified": verified,
-                "verified_all": rectified_class_probabilities(probability2_all, verified),
+                "verified_all": verified_all,
             }
             context = int(detail["context"][0])
             if target is not None:

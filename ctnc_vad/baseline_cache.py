@@ -26,7 +26,14 @@ def valid_score(path: Path, length: int) -> bool:
     try:
         artifact = np.load(path, allow_pickle=False)
         try:
-            return "prob2" in artifact.files and len(artifact["prob2"]) == length
+            return (
+                "prob2" in artifact.files
+                and "prob2_all" in artifact.files
+                and len(artifact["prob2"]) == length
+                and np.asarray(artifact["prob2_all"]).ndim == 2
+                and len(artifact["prob2_all"]) == length
+                and np.asarray(artifact["prob2_all"]).shape[1] >= 2
+            )
         finally:
             artifact.close()
     except Exception:
@@ -61,12 +68,15 @@ def prepare_score_cache(
     return result
 
 
-def load_cached_probability(path: Path, expected_length: int) -> np.ndarray:
+def load_cached_probabilities(path: Path, expected_length: int) -> np.ndarray:
     artifact = np.load(path, allow_pickle=False)
     try:
-        value = np.asarray(artifact["prob2"], dtype=np.float32)
+        value = np.asarray(artifact["prob2_all"], dtype=np.float32)
     finally:
         artifact.close()
-    if value.ndim != 1 or len(value) != expected_length:
-        raise ValueError(f"{path}: expected cached prob2 with length {expected_length}, got {value.shape}")
+    if value.ndim != 2 or len(value) != expected_length or value.shape[1] < 2:
+        raise ValueError(f"{path}: expected cached [T,classes] prob2_all, got {value.shape}")
+    if not np.isfinite(value).all() or np.any(value < 0):
+        raise ValueError(f"{path}: cached class probabilities are invalid")
+    value = value / np.maximum(value.sum(axis=1, keepdims=True), 1e-6)
     return value

@@ -27,27 +27,29 @@ def model_state(path: str | Path) -> dict:
 @torch.no_grad()
 def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.device, topk: int) -> dict[str, np.ndarray]:
     length = int(item["length"])
-    # Audit concerns hidden-channel evidence. It therefore uses an uninformative
-    # 0.5 baseline prior and does not alter any VAD score or baseline weight.
+    # Audit concerns hidden-channel evidence. It therefore uses a uniform
+    # prompt prior and does not load, alter, or need any VadCLIP score.
+    class_count = model.class_count
     outputs = model(
         item["circuit"].unsqueeze(0).to(device),
         item["last_hidden"].unsqueeze(0).to(device),
-        torch.full((1, length), 0.5, dtype=torch.float32, device=device),
+        torch.full((1, length, class_count), 1.0 / class_count, dtype=torch.float32, device=device),
         torch.tensor([length], dtype=torch.int64, device=device),
+        return_channel_contribution=True,
     )
-    contribution = outputs["channel_evidence"].abs()
-    count = min(int(topk), contribution.shape[-1])
-    values, indices = contribution[0, :length].topk(count, dim=-1)
+    contribution = outputs["channel_contribution"].abs()
+    count = min(int(topk), contribution.shape[-2])
+    values, indices = contribution[0, :length].topk(count, dim=-2)
     return {
-        "signed_evidence": outputs["signed_evidence"][0, :length].cpu().numpy().astype(np.float32),
-        "layer_evidence": outputs["layer_evidence"][0, :length].cpu().numpy().astype(np.float32),
-        "agreement": outputs["agreement"][0, :length].cpu().numpy().astype(np.float32),
-        "text_margin": outputs["text_margin"][0, :length].cpu().numpy().astype(np.float32),
-        "text_similarity": outputs["text_similarity"][0, :length].cpu().numpy().astype(np.float32),
+        "hidden_anomaly": outputs["hidden_anomaly"][0, :length].cpu().numpy().astype(np.float32),
+        "class_evidence": outputs["class_evidence"][0, :length].cpu().numpy().astype(np.float32),
+        "normalized_state": outputs["normalized_state"][0, :length].cpu().numpy().astype(np.float32),
         "normal_context": outputs["context"].cpu().numpy().astype(np.int64),
         "gate": outputs["gates"].cpu().numpy().astype(np.float32),
-        "top_circuit_index": indices.cpu().numpy().astype(np.int64),
-        "top_circuit_contribution": values.cpu().numpy().astype(np.float32),
+        "class_gain": outputs["class_gains"].cpu().numpy().astype(np.float32),
+        "verification_strength": outputs["verification_strength"].reshape(1).cpu().numpy().astype(np.float32),
+        "top_circuit_index_by_class": indices.cpu().numpy().astype(np.int64),
+        "top_circuit_contribution_by_class": values.cpu().numpy().astype(np.float32),
     }
 
 

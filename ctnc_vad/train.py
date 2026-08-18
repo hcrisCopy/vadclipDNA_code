@@ -43,7 +43,7 @@ def checkpoint_state(path: Path) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the CTNC sparse normality reader with frozen VadCLIP evaluation.")
+    parser = argparse.ArgumentParser(description="Train the CTNC text-conditioned channel verifier with frozen VadCLIP evaluation.")
     parser.add_argument("--dataset", choices=["xd", "ucf"], required=True)
     parser.add_argument("--source-train-csv", required=True)
     parser.add_argument("--source-test-csv", required=True)
@@ -66,10 +66,13 @@ def main() -> None:
     parser.add_argument("--scheduler-rate", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--normal-frame-weight", type=float, default=0.25)
-    parser.add_argument("--preserve-weight", type=float, default=0.02, help="Keep uncertain outputs close to the frozen baseline.")
+    parser.add_argument("--preserve-weight", type=float, default=0.01, help="Keep uncertain outputs close to the frozen baseline.")
     parser.add_argument("--sparsity-weight", type=float, default=1e-3)
     parser.add_argument("--gate-initial-logit", type=float, default=0.0)
-    parser.add_argument("--keep-initial-logit", type=float, default=5.0, help="Initial preference for no score change.")
+    parser.add_argument(
+        "--verification-initial-logit", type=float, default=-1.5,
+        help="Initial hidden-evidence strength after sigmoid; -1.5 starts at about 0.18.",
+    )
     parser.add_argument("--alignment", choices=["strict", "crop_hidden", "pad_hidden"], default="crop_hidden")
     parser.add_argument("--seed", type=int, default=234)
     parser.add_argument("--device", default="cuda")
@@ -145,7 +148,7 @@ def main() -> None:
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda"
     )
-    model = ChannelRankVerifier(assets, args.gate_initial_logit, args.keep_initial_logit).to(device)
+    model = ChannelRankVerifier(assets, args.gate_initial_logit, args.verification_initial_logit).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = MultiStepLR(optimizer, args.scheduler_milestones, args.scheduler_rate)
     gt = np.load(args.gt_path)
@@ -169,15 +172,15 @@ def main() -> None:
         totals = {"loss": 0.0, "bag": 0.0, "normal": 0.0, "preserve": 0.0, "sparse": 0.0}
         batches = 0
         progress = tqdm(train_loader, desc=f"CTNC train {epoch + 1}/{args.max_epoch}", unit="batch")
-        for circuit, last_hidden, baseline_score, lengths, labels in progress:
+        for circuit, last_hidden, baseline_probability, lengths, class_targets in progress:
             circuit = circuit.to(device, non_blocking=True)
             last_hidden = last_hidden.to(device, non_blocking=True)
-            baseline_score = baseline_score.to(device, non_blocking=True)
+            baseline_probability = baseline_probability.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            outputs = model(circuit, last_hidden, baseline_score, lengths)
+            class_targets = class_targets.to(device, non_blocking=True)
+            outputs = model(circuit, last_hidden, baseline_probability, lengths)
             loss, pieces = verifier_loss(
-                outputs, labels, lengths, args.normal_frame_weight, args.preserve_weight, args.sparsity_weight
+                outputs, class_targets, lengths, args.normal_frame_weight, args.preserve_weight, args.sparsity_weight
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -186,7 +189,10 @@ def main() -> None:
             totals["loss"] += float(loss.detach())
             for name in ("bag", "normal", "preserve", "sparse"):
                 totals[name] += pieces[name]
-            progress.set_postfix(loss=f"{float(loss.detach()):.4f}", keep=f"{float(outputs['keep'].detach().mean()):.3f}")
+            progress.set_postfix(
+                loss=f"{float(loss.detach()):.4f}",
+                strength=f"{float(outputs['verification_strength'].detach()):.3f}",
+            )
         scheduler.step()
 
         # Same model mode and official frame metrics as VadCLIP; the frozen baseline is deliberately re-evaluated.
@@ -234,7 +240,7 @@ def main() -> None:
         save_json(output / "validation_last.json", validation)
         print(
             f"epoch {epoch + 1}/{args.max_epoch} | loss={row['loss']:.5f} | "
-            f"baseline AP2={row['baseline_ap2']:.6f} | channel AUC/AP={row['evidence_auc']:.6f}/{row['evidence_ap']:.6f} | "
+            f"baseline AP2={row['baseline_ap2']:.6f} | hidden-only AUC/AP={row['evidence_auc']:.6f}/{row['evidence_ap']:.6f} | "
             f"final AUC={row['final_auc']:.6f} {selection_name}={row['final_ap']:.6f} dMAP={row['final_dmap']:.2f}% | "
             f"best={best_metric:.6f}",
             flush=True,

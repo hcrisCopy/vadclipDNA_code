@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .baseline_cache import load_cached_probability
+from .baseline_cache import load_cached_probabilities
 from .common import (
     align_hidden,
     base_key,
@@ -19,6 +19,7 @@ from .common import (
     read_source_csv,
     resample_for_train,
     resolve_path,
+    video_label_vector,
 )
 
 
@@ -97,28 +98,28 @@ class HiddenBagDataset(Dataset):
         circuit = select_circuit(hidden, self.selected_layers, self.selected_dimensions)
         last_hidden = hidden[:, -1, :].astype(np.float32, copy=False)
         score_path = self.baseline_scores_by_key.get(str(item["key"]))
-        baseline_score = None if score_path is None else load_cached_probability(score_path, len(feature))
-        return circuit, last_hidden, feature, baseline_score
+        baseline_probability = None if score_path is None else load_cached_probabilities(score_path, len(feature))
+        return circuit, last_hidden, feature, baseline_probability
 
     def __getitem__(self, index: int):
         item = self.items[index]
-        circuit, last_hidden, feature, baseline_score = self._load(index)
+        circuit, last_hidden, feature, baseline_probability = self._load(index)
         if self.training:
             circuit, valid_length = resample_for_train(circuit, self.visual_length)
             last_hidden, valid_last_length = resample_for_train(last_hidden, self.visual_length)
             if valid_length != valid_last_length:
                 raise RuntimeError("circuit and final hidden resampling disagree")
-            if baseline_score is None:
-                raise RuntimeError("training the CTNC verifier requires cached frozen-baseline scores")
-            baseline_score, valid_score_length = resample_for_train(baseline_score[:, None], self.visual_length)
-            if valid_length != valid_score_length:
-                raise RuntimeError("circuit and frozen-baseline score resampling disagree")
+            if baseline_probability is None:
+                raise RuntimeError("training the CTNC verifier requires cached frozen-baseline probabilities")
+            baseline_probability, valid_probability_length = resample_for_train(baseline_probability, self.visual_length)
+            if valid_length != valid_probability_length:
+                raise RuntimeError("circuit and frozen-baseline probability resampling disagree")
             return (
                 torch.from_numpy(circuit),
                 torch.from_numpy(last_hidden),
-                torch.from_numpy(baseline_score[:, 0]),
+                torch.from_numpy(baseline_probability),
                 torch.tensor(valid_length, dtype=torch.int64),
-                torch.tensor(0 if is_normal_video(self.dataset, str(item["label"])) else 1, dtype=torch.float32),
+                torch.from_numpy(video_label_vector(self.dataset, str(item["label"]))[1:]),
             )
         return {
             "circuit": torch.from_numpy(circuit),
