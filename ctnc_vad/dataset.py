@@ -71,7 +71,13 @@ class HiddenBagDataset(Dataset):
             self.items.append({
                 "key": key,
                 "label": str(row["label"]),
-                "feature_paths": [resolve_path(str(value), self.source_path_base) for value in group["path"].astype(str)],
+                # XD train CSVs contain multiple feature augmentations for one
+                # video key (``__0`` ... ``__9``), while the cached CLIP hidden
+                # state is one video-level trajectory.  CTNC trains one circuit
+                # per trajectory, so it uses the deterministically first feature
+                # only as a temporal-alignment reference.  The circuit itself
+                # never consumes this 512D feature during training.
+                "feature_path": resolve_path(str(group.iloc[0]["path"]), self.source_path_base),
                 "hidden_path": hidden_path,
             })
         if not self.items:
@@ -83,7 +89,7 @@ class HiddenBagDataset(Dataset):
     def _load(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         item = self.items[index]
         hidden = load_hidden(item["hidden_path"])
-        feature = np.concatenate([load_clip_feature(path) for path in item["feature_paths"]], axis=0)
+        feature = load_clip_feature(item["feature_path"])
         hidden, _action = align_hidden(hidden, len(feature), self.alignment)
         circuit = select_circuit(hidden, self.selected_layers, self.selected_dimensions)
         last_hidden = hidden[:, -1, :].astype(np.float32, copy=False)
