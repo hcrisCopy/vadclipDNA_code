@@ -6,7 +6,7 @@
 
 迁移前会严格检查：两边都是 CLIP ViT-B/16、CLS token、DSANet FDU 指纹一致、完整
 chunk 名和标签一致，以及每个 FDU 与 VadCLIP 特征的时间长度 `T` 完全一致。不会裁剪、补零或重新定位。
-旧版 DSANet `fdu_indices.json` 若没有 `token_pool` 字段，会按其历史 CLS-only 导出契约兼容，并在新 contract 中记录推断来源。
+旧版 DSANet `fdu_indices.json` 若没有 `token_pool` 字段，会按其历史 CLS-only 导出契约兼容，并在新 contract 中记录推断来源。若旧导出目录没有 `export_spec.json`，代码会进入兼容模式：检查每个 FDU 的维度和时间轴，并在摘要中记录该限制；有 `export_spec.json` 时仍执行完整 FDU 指纹校验。
 
 从 `vadclipDNA_code` 目录运行。下面的相对路径对应 DSANet 已完成 XD FDU 导出的标准产物；如服务器的数据挂载目录不同，只替换输入相对路径，不要改代码。
 

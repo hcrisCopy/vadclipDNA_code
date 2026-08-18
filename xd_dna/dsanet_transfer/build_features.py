@@ -213,6 +213,7 @@ def _stage_spec(
     records: list[FDURecord],
     stats_path: Path,
     input_width: int,
+    fdu_validation: dict,
 ) -> dict:
     return {
         "format_version": 1,
@@ -223,6 +224,7 @@ def _stage_spec(
         "dsanet_fdu_manifest_sha256": sha256_file(fdu_manifest),
         "fdu_source_fingerprint": source_fingerprint(records),
         "normal_stats_sha256": sha256_file(stats_path),
+        "dsanet_export_validation": fdu_validation,
         "temporal_alignment": "strict",
         "input_width": input_width,
     }
@@ -279,7 +281,7 @@ def main() -> None:
     list_root.mkdir(parents=True, exist_ok=True)
 
     contract = load_transfer_contract(contract_path)
-    validate_dsanet_export_spec(fdu_manifest, contract)
+    fdu_validation = validate_dsanet_export_spec(fdu_manifest, contract)
     width, input_width = int(contract["neuron_width"]), int(contract["input_width"])
     source = read_vadclip_list(source_list)
     fdu_by_variant = read_dsanet_manifest(
@@ -311,7 +313,10 @@ def main() -> None:
     else:
         mean, std = _load_normal_stats(stats_path, stats_metadata_path, contract_path, width)
 
-    spec = _stage_spec(args.split, contract_path, source_list, fdu_manifest, [record for _row, record in items], stats_path, input_width)
+    spec = _stage_spec(
+        args.split, contract_path, source_list, fdu_manifest,
+        [record for _row, record in items], stats_path, input_width, fdu_validation,
+    )
     _prepare_stage_spec(stage, spec)
     output_csv = list_root / f"xd_dsanet_transfer_{args.split}.csv"
     rows, alignment_rows = [], []
@@ -363,6 +368,7 @@ def main() -> None:
         "dsanet_fdu_manifest": relative_metadata_path(fdu_manifest, stage),
         "neuron_contract": relative_metadata_path(contract_path, stage),
         "normal_stats": relative_metadata_path(stats_path, stage),
+        "dsanet_export_validation": fdu_validation,
         "strict_temporal_alignment": True,
         "rows_written": len(rows), "rows_skipped": len(skipped),
         "neuron_width": width, "input_width": input_width,

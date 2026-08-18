@@ -295,21 +295,46 @@ def match_records(source: pd.DataFrame, fdu_records: dict[str, FDURecord]) -> tu
     return matched, missing
 
 
-def validate_dsanet_export_spec(manifest_path: str | Path, contract: dict) -> None:
-    """Require the FDU manifest to have been exported from the exact transferred list."""
-    spec_path = Path(manifest_path).resolve().parent / "export_spec.json"
-    if not spec_path.is_file():
-        raise FileNotFoundError(
-            f"{spec_path}: DSANet export_spec.json is required to prove the FDU feature contract"
-        )
-    spec = load_json_object(spec_path)
+def validate_dsanet_export_spec(manifest_path: str | Path, contract: dict) -> dict:
+    """Validate current and legacy DSANet FDU-export metadata.
+
+    New DSANet exports include ``export_spec.json`` with an FDU fingerprint.
+    Older completed exports commonly contain only ``aligned_features.csv`` and
+    ``features/*.npy`` (sometimes plus ``summary.json``).  The latter cannot
+    prove a neuron-list fingerprint retroactively, but is still safe to reuse
+    after the caller checks every array's width and timeline.  The returned
+    evidence is persisted so results cannot be mistaken for the stricter mode.
+    """
+    root = Path(manifest_path).resolve().parent
+    spec_path = root / "export_spec.json"
     expected_width = int(contract["neuron_width"])
-    if int(spec.get("fdu_dim", -1)) != expected_width:
-        raise ValueError(f"{spec_path}: fdu_dim does not match transfer contract")
-    if str(spec.get("fdu_fingerprint", "")) != str(contract["source_fdu_fingerprint"]):
-        raise ValueError(f"{spec_path}: fdu_fingerprint does not match transferred DSANet neurons")
-    if str(spec.get("token_pool", EXPECTED_TOKEN_POOL)) != EXPECTED_TOKEN_POOL:
-        raise ValueError(f"{spec_path}: token_pool is not {EXPECTED_TOKEN_POOL!r}")
+    if spec_path.is_file():
+        spec = load_json_object(spec_path)
+        if int(spec.get("fdu_dim", -1)) != expected_width:
+            raise ValueError(f"{spec_path}: fdu_dim does not match transfer contract")
+        if str(spec.get("fdu_fingerprint", "")) != str(contract["source_fdu_fingerprint"]):
+            raise ValueError(f"{spec_path}: fdu_fingerprint does not match transferred DSANet neurons")
+        if str(spec.get("token_pool", EXPECTED_TOKEN_POOL)) != EXPECTED_TOKEN_POOL:
+            raise ValueError(f"{spec_path}: token_pool is not {EXPECTED_TOKEN_POOL!r}")
+        return {
+            "mode": "export_spec_fingerprint",
+            "message": "DSANet export_spec.json matched the transferred FDU fingerprint.",
+        }
+
+    summary_path = root / "summary.json"
+    if summary_path.is_file():
+        summary = load_json_object(summary_path)
+        reported_width = summary.get("fdu_dim")
+        if reported_width is not None and int(reported_width) != expected_width:
+            raise ValueError(f"{summary_path}: fdu_dim does not match transfer contract")
+        return {
+            "mode": "legacy_summary_and_array_shape",
+            "message": "No export_spec.json; summary.json and every reused FDU array are checked for the requested width.",
+        }
+    return {
+        "mode": "legacy_array_shape_only",
+        "message": "No DSANet export metadata; every reused FDU array is checked for the requested width and strict timeline.",
+    }
 
 
 def remove_tree(path: Path) -> None:
@@ -319,4 +344,3 @@ def remove_tree(path: Path) -> None:
     import shutil
 
     shutil.rmtree(path)
-
