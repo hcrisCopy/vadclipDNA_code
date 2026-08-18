@@ -85,9 +85,29 @@ def load_json_object(path: str | Path) -> dict:
     return value
 
 
+def resolve_dsanet_token_pool(specification: dict, source: str | Path) -> tuple[str, str]:
+    """Read current and legacy DSANet FDU token-pool metadata safely.
+
+    Older DSANet ``fdu_indices.json`` files predate the ``token_pool`` field.
+    Their FDU exporter had a fixed CLS-only implementation, so this legacy
+    representation remains compatible with VadCLIP's ViT-B/16 CLS contract.
+    The inference source is returned and persisted in the transfer contract.
+    """
+    explicit = specification.get("token_pool")
+    if explicit is not None:
+        return str(explicit), "explicit_token_pool"
+
+    definition = str(specification.get("unit_definition", "")).lower()
+    if "cls" in definition:
+        return EXPECTED_TOKEN_POOL, "inferred_from_unit_definition"
+    if "patch" in definition or "spatial" in definition:
+        return "patch_mean", "inferred_from_unit_definition"
+    return EXPECTED_TOKEN_POOL, "legacy_default_cls"
+
+
 def validate_dsanet_fdu_spec(specification: dict, source: str | Path) -> list[dict]:
     """Validate that a DSANet FDU list can address VadCLIP's ViT-B/16 hidden state."""
-    required = {"clip_model", "token_pool", "num_fdus", "fdus"}
+    required = {"clip_model", "num_fdus", "fdus"}
     missing = required - set(specification)
     if missing:
         raise ValueError(f"{source}: DSANet FDU JSON is missing {sorted(missing)}")
@@ -95,9 +115,10 @@ def validate_dsanet_fdu_spec(specification: dict, source: str | Path) -> list[di
         raise ValueError(
             f"{source}: requires clip_model={EXPECTED_CLIP_MODEL!r}, got {specification['clip_model']!r}"
         )
-    if str(specification["token_pool"]) != EXPECTED_TOKEN_POOL:
+    token_pool, _evidence = resolve_dsanet_token_pool(specification, source)
+    if token_pool != EXPECTED_TOKEN_POOL:
         raise ValueError(
-            f"{source}: only {EXPECTED_TOKEN_POOL!r} FDU features are compatible, got {specification['token_pool']!r}"
+            f"{source}: only {EXPECTED_TOKEN_POOL!r} FDU features are compatible, got {token_pool!r}"
         )
     fdus = specification["fdus"]
     if not isinstance(fdus, list) or not fdus:
@@ -298,5 +319,4 @@ def remove_tree(path: Path) -> None:
     import shutil
 
     shutil.rmtree(path)
-
 

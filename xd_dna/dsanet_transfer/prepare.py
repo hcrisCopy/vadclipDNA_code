@@ -13,6 +13,7 @@ from .common import (
     output_path,
     relative_metadata_path,
     remove_tree,
+    resolve_dsanet_token_pool,
     sha256_file,
     validate_dsanet_fdu_spec,
 )
@@ -38,13 +39,15 @@ def main() -> None:
     source = Path(args.dsanet_fdu_json).resolve()
     specification = load_json_object(source)
     fdus = validate_dsanet_fdu_spec(specification, source)
+    source_token_pool, token_pool_evidence = resolve_dsanet_token_pool(specification, source)
     target = stage / "dsanet_transfer_neurons.json"
     contract = {
         "format_version": 1,
         "method": "DSANet-localized DNA neuron transfer to VadCLIP",
         "dataset": "xd",
         "clip_model": "ViT-B/16",
-        "token_pool": "cls",
+        "token_pool": source_token_pool,
+        "source_token_pool_evidence": token_pool_evidence,
         "unit_definition": "frozen CLIP ViT-B/16 visual block output CLS dimension",
         "source_project": "DSANet_DNA",
         "source_fdu_json": relative_metadata_path(source, target.parent),
