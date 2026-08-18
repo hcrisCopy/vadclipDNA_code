@@ -1,13 +1,13 @@
-"""Text-conditioned, hidden-channel probability verifier for frozen VAD.
+"""Counterfactual temporal-normality circuits for a frozen VAD predictor.
 
-The verifier is deliberately a *prediction-space* sidecar: it never injects a
-residual into VadCLIP features and never updates a VadCLIP weight. A sparse set
-of CLIP coordinates is selected before reader training. Each coordinate has an
-explicit signed affinity to every anomaly text prompt. At inference the reader
-compares it with a scene-conditioned normal bank and uses the result as a
-class-specific likelihood factor on the frozen VadCLIP probabilities.
+The module never writes to VadCLIP. It reads two observable deviations of each
+selected CLIP hidden coordinate from a normal-video memory: its state and its
+frame-to-frame transition. Both are combined by an explicit
+layer--dimension--text linear circuit and used only to re-rank frozen outputs.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -23,15 +23,24 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
 
 
-class ChannelRankVerifier(nn.Module):
-    """Interpretable class-wise product-of-experts over frozen VadCLIP output.
+def inverse_softplus(value: float) -> float:
+    """Stable scalar initialization for a positive ``softplus`` parameter."""
+    if value <= 0:
+        raise ValueError("softplus initialization must be positive")
+    return math.log(math.expm1(value))
 
-    ``baseline_probability`` contains the original VadCLIP prompt
-    probabilities ``[normal, anomaly_1, ...]``. The learned variables are a
-    sparse gate for every ``(hidden coordinate, anomaly prompt)`` pair, a
-    prompt gain, and a global strength. Thus every final-score change can be
-    traced to a layer, a coordinate, its normal-state deviation, and a text
-    prompt; there is no opaque feature mixer.
+
+class ChannelRankVerifier(nn.Module):
+    """Auditable state-and-transition likelihood circuit over frozen VadCLIP.
+
+    For anomaly text ``c`` and frame ``t``, the circuit computes
+
+    ``E_c(t) = a_c sum_k w_state[k,c] z_state[t,k]
+              + b_c sum_k w_transition[k,c] novelty[t,k]``.
+
+    ``z_state`` and ``novelty`` are normalized against a context selected only
+    from normal videos. Every weight is retained for audit; there is no hidden
+    MLP or feature residual.
     """
 
     def __init__(
@@ -58,46 +67,95 @@ class ChannelRankVerifier(nn.Module):
         self.register_buffer("context_centers", assets["context_centers"].float())
         self.register_buffer("state_mean", assets["state_mean"].float())
         self.register_buffer("state_std", assets["state_std"].float().clamp_min(1e-6))
+        self.register_buffer("transition_mean", assets["transition_mean"].float())
+        self.register_buffer("transition_std", assets["transition_std"].float().clamp_min(1e-6))
         self.register_buffer("selected_layers", assets["selected_layers"].long())
         self.register_buffer("selected_text_direction", assets["selected_text_direction"].float())
         self.register_buffer("selected_text_class", assets["selected_text_class"].long())
 
-        # Column normalization prevents one prompt from winning solely because
-        # its offline semantic-lens coefficient has a larger numeric scale.
-        # The signed affinity itself is retained as the explanation.
-        scale = affinity.abs().mean(dim=0, keepdim=True).clamp_min(1e-6)
+        # RMS normalization preserves the frozen signed semantic direction but
+        # avoids an L1 denominator shrinking hundreds of atoms to zero.
+        scale = affinity.square().mean(dim=0, keepdim=True).sqrt().clamp_min(1e-6)
         self.register_buffer("text_affinity", affinity / scale)
-        # Different anomaly texts need not use the same CLIP coordinate. The
-        # gate matrix is still fully auditable: row k / column c is exactly
-        # the contribution permission for hidden coordinate k and text c.
-        self.class_gate_logits = nn.Parameter(
+        # State circuit: a gate keeps sparsity and an explicit, bounded local
+        # correction can handle a domain-inverted text direction. The latter
+        # is anchored to zero by the loss and exported for audit.
+        self.state_gate_logits = nn.Parameter(
             torch.full((width, self.anomaly_class_count), float(gate_initial_logit))
         )
-        self.class_gain_logits = nn.Parameter(torch.full((self.anomaly_class_count,), -0.5))
-        self.verification_logit = nn.Parameter(torch.tensor(float(verification_initial_logit)))
-        self.hidden_temperature_logits = nn.Parameter(torch.zeros(self.anomaly_class_count))
-        self.hidden_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -3.0))
+        self.state_correction_logits = nn.Parameter(torch.zeros(width, self.anomaly_class_count))
+        # Transition circuit is a positive normality-surprise detector whose
+        # text relevance comes from the same frozen visual-to-text lens.
+        self.transition_gate_logits = nn.Parameter(
+            torch.full((width, self.anomaly_class_count), float(gate_initial_logit))
+        )
+        self.state_scale_logits = nn.Parameter(
+            torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
+        )
+        self.transition_scale_logits = nn.Parameter(
+            torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
+        )
+        initial_rank_scale = max(0.05, float(torch.sigmoid(torch.tensor(verification_initial_logit))))
+        self.rank_scale_logits = nn.Parameter(
+            torch.full((self.anomaly_class_count,), inverse_softplus(initial_rank_scale))
+        )
+        self.hidden_temperature_logits = nn.Parameter(
+            torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
+        )
+        self.hidden_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -2.0))
 
     def _context_indices(self, last_hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         signature = F.normalize(masked_mean(last_hidden, mask), dim=-1, eps=1e-6)
         return (signature @ self.context_centers.t()).argmax(dim=-1)
 
-    def _channel_state(
-        self, circuit: torch.Tensor, last_hidden: torch.Tensor, mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _channel_state(self, circuit: torch.Tensor, last_hidden: torch.Tensor, mask: torch.Tensor) -> dict[str, torch.Tensor]:
         context = self._context_indices(last_hidden, mask)
         state_mean, state_std = self.state_mean[context], self.state_std[context]
-        # The bounded standardized deviation is the primitive explanation. It
-        # is comparable across layers/coordinates and robust to one outlier.
+        transition_mean, transition_std = self.transition_mean[context], self.transition_std[context]
         normalized_state = torch.tanh((circuit - state_mean.unsqueeze(1)) / (3.0 * state_std.unsqueeze(1)))
-        class_gates = torch.sigmoid(self.class_gate_logits)
-        text_weight = self.text_affinity * class_gates
-        denominator = text_weight.abs().sum(dim=0).clamp_min(1e-6)
-        class_evidence = torch.einsum("btk,kc->btc", normalized_state, text_weight) / denominator.view(1, 1, -1)
-        # This aggregate is used only for a compact per-coordinate summary;
-        # class_gates retains the actual class-specific explanation.
-        gates = class_gates.mean(dim=1)
-        return context, normalized_state, gates, class_gates, class_evidence
+        delta = torch.cat((torch.zeros_like(circuit[:, :1]), circuit[:, 1:] - circuit[:, :-1]), dim=1)
+        normalized_transition = torch.tanh(
+            (delta - transition_mean.unsqueeze(1)) / (3.0 * transition_std.unsqueeze(1))
+        )
+        # Normal transitions have an expected bounded absolute response of
+        # roughly .25. Removing this floor produces local novelty, not a
+        # constant anomaly bias in every ordinary frame.
+        transition_novelty = F.relu(normalized_transition.abs() - 0.25)
+        transition_novelty[:, 0] = 0.0
+
+        state_gates = torch.sigmoid(self.state_gate_logits)
+        transition_gates = torch.sigmoid(self.transition_gate_logits)
+        state_correction = 0.5 * torch.tanh(self.state_correction_logits)
+        state_weights = self.text_affinity * state_gates + state_correction
+        transition_weights = self.text_affinity.abs() * transition_gates
+        state_denominator = state_weights.square().sum(dim=0).sqrt().clamp_min(1e-6)
+        transition_denominator = transition_weights.square().sum(dim=0).sqrt().clamp_min(1e-6)
+        state_evidence = torch.einsum("btk,kc->btc", normalized_state, state_weights)
+        state_evidence = state_evidence / state_denominator.view(1, 1, -1)
+        transition_evidence = torch.einsum("btk,kc->btc", transition_novelty, transition_weights)
+        transition_evidence = transition_evidence / transition_denominator.view(1, 1, -1)
+        state_scales = F.softplus(self.state_scale_logits)
+        transition_scales = F.softplus(self.transition_scale_logits)
+        class_evidence = (
+            state_evidence * state_scales.view(1, 1, -1)
+            + transition_evidence * transition_scales.view(1, 1, -1)
+        )
+        return {
+            "context": context,
+            "normalized_state": normalized_state,
+            "normalized_transition": normalized_transition,
+            "transition_novelty": transition_novelty,
+            "state_gates": state_gates,
+            "transition_gates": transition_gates,
+            "state_correction": state_correction,
+            "state_weights": state_weights,
+            "transition_weights": transition_weights,
+            "state_evidence": state_evidence,
+            "transition_evidence": transition_evidence,
+            "class_evidence": class_evidence,
+            "state_scales": state_scales,
+            "transition_scales": transition_scales,
+        }
 
     def forward(
         self,
@@ -116,27 +174,23 @@ class ChannelRankVerifier(nn.Module):
             raise ValueError(f"baseline probabilities must have shape {expected}, got {tuple(baseline_probability.shape)}")
         times = torch.arange(circuit.shape[1], device=circuit.device).unsqueeze(0)
         mask = times < lengths.unsqueeze(1)
-        context, normalized_state, gates, class_gates, class_evidence = self._channel_state(circuit, last_hidden, mask)
+        atoms = self._channel_state(circuit, last_hidden, mask)
+        rank_scales = F.softplus(self.rank_scale_logits)
 
-        # Product-of-experts fusion: log frozen probabilities + transparent
-        # hidden likelihood factors. This is output re-ranking, not an injected
-        # hidden residual or a changed baseline classifier.
-        gains = F.softplus(self.class_gain_logits)
-        strength = torch.sigmoid(self.verification_logit)
-        hidden_factor = torch.tanh(class_evidence) * gains.view(1, 1, -1) * strength
+        # Explicit likelihood-ratio fusion. It changes only prediction order;
+        # no baseline feature, encoder, temporal module, or classifier changes.
         log_probability = baseline_probability.clamp_min(1e-6).log()
+        hidden_factor = atoms["class_evidence"] * rank_scales.view(1, 1, -1)
         fused_logits = torch.cat((log_probability[..., :1], log_probability[..., 1:] + hidden_factor), dim=-1)
-        verified_all = F.softmax(fused_logits, dim=-1)
-        verified_all = verified_all.masked_fill(~mask.unsqueeze(-1), 0.0)
+        verified_all = F.softmax(fused_logits, dim=-1).masked_fill(~mask.unsqueeze(-1), 0.0)
         verified = 1.0 - verified_all[..., 0]
 
-        # A direct hidden MIL head trains the sparse circuit to be meaningful
-        # even when a frozen baseline initially assigns very low probability to
-        # the correct class. Its parameters are only class temperatures and
-        # priors, not a hidden MLP, so its scores stay traceable to channels.
+        # The direct hidden probe is the same declared evidence under a
+        # class-wise logistic calibration, not an independent black-box head.
         hidden_temperature = F.softplus(self.hidden_temperature_logits)
         hidden_probability = torch.sigmoid(
-            class_evidence * hidden_temperature.view(1, 1, -1) + self.hidden_bias.view(1, 1, -1)
+            atoms["class_evidence"] * hidden_temperature.view(1, 1, -1)
+            + self.hidden_bias.view(1, 1, -1)
         )
         hidden_anomaly = (1.0 - (1.0 - hidden_probability).prod(dim=-1)).masked_fill(~mask, 0.0)
         result = {
@@ -144,23 +198,27 @@ class ChannelRankVerifier(nn.Module):
             "verified_all": verified_all,
             "baseline_probability": baseline_probability,
             "mask": mask,
-            "context": context,
-            "normalized_state": normalized_state,
-            "class_evidence": class_evidence,
-            "hidden_probability": hidden_probability,
+            "rank_scales": rank_scales,
             "hidden_anomaly": hidden_anomaly,
-            "gates": gates,
-            "class_gates": class_gates,
-            "class_gains": gains,
-            "verification_strength": strength,
+            "hidden_probability": hidden_probability,
+            # Aliases keep the evaluator contract stable.
+            "gates": atoms["state_gates"].mean(dim=1),
+            "class_gates": atoms["state_gates"],
+            "class_gains": rank_scales,
+            "verification_strength": rank_scales.mean(),
+            **atoms,
         }
         if return_channel_contribution:
-            # Requested only by audit (one video at a time), avoiding an
-            # unnecessary [B,T,K,C] training allocation.
+            result["state_channel_contribution"] = (
+                atoms["normalized_state"].unsqueeze(-1)
+                * atoms["state_weights"].view(1, 1, self.width, self.anomaly_class_count)
+            )
+            result["transition_channel_contribution"] = (
+                atoms["transition_novelty"].unsqueeze(-1)
+                * atoms["transition_weights"].view(1, 1, self.width, self.anomaly_class_count)
+            )
             result["channel_contribution"] = (
-                normalized_state.unsqueeze(-1)
-                * class_gates.view(1, 1, self.width, self.anomaly_class_count)
-                * self.text_affinity.view(1, 1, self.width, self.anomaly_class_count)
+                result["state_channel_contribution"] + result["transition_channel_contribution"]
             )
         return result
 
@@ -183,12 +241,9 @@ def verifier_loss(
     preserve_weight: float,
     sparsity_weight: float,
     hidden_mil_weight: float,
+    semantic_anchor_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Official video-category MIL supervision plus a frozen-output tether.
-
-    ``class_targets`` comes from the dataset annotation (and is multi-label
-    for XD combinations), never from a VadCLIP score threshold.
-    """
+    """Weak-label circuit learning plus an explicit semantic-prior anchor."""
     pooled = mil_topk_mean(outputs["verified_all"][..., 1:], lengths)
     bag = F.binary_cross_entropy(pooled, class_targets)
     hidden_pooled = mil_topk_mean(outputs["hidden_probability"], lengths)
@@ -202,13 +257,15 @@ def verifier_loss(
         normal_loss = torch.zeros((), device=class_targets.device)
     difference = (outputs["verified_all"] - outputs["baseline_probability"]).abs().mean(dim=-1)
     preserve = (difference * outputs["mask"].to(difference.dtype)).sum() / outputs["mask"].sum().clamp_min(1)
-    sparse = outputs["class_gates"].mean()
+    sparse = 0.5 * (outputs["state_gates"].mean() + outputs["transition_gates"].mean())
+    semantic_anchor = outputs["state_correction"].square().mean()
     total = (
         bag
         + float(hidden_mil_weight) * hidden_bag
         + float(normal_weight) * normal_loss
         + float(preserve_weight) * preserve
         + float(sparsity_weight) * sparse
+        + float(semantic_anchor_weight) * semantic_anchor
     )
     return total, {
         "bag": float(bag.detach()),
@@ -216,6 +273,7 @@ def verifier_loss(
         "normal": float(normal_loss.detach()),
         "preserve": float(preserve.detach()),
         "sparse": float(sparse.detach()),
+        "semantic_anchor": float(semantic_anchor.detach()),
         "pooled_normal": float(pooled[normal].mean().detach()) if bool(normal.any()) else float("nan"),
         "pooled_abnormal": float(pooled[~normal].mean().detach()) if bool((~normal).any()) else float("nan"),
     }

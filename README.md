@@ -17,7 +17,7 @@ CTNC 将每个最终分数的变化分解为可检查的链条：
                     |
 离线发现：层 / 通道 / 对应异常文本 / 正负方向
                     |
-测试时：相对相似正常场景的标准化通道偏离
+测试时：相对相似正常场景的状态偏离 + 状态转移惊异度
                     |
 每个文本类别各自得到 hidden evidence
                     |
@@ -36,8 +36,9 @@ softmax 后的类别概率与异常分数（排序/定位）
 - 它经冻结 CLIP `hidden → visual projection → text` 路径与哪一个异常文本最相关；
 - 该通道朝向该文本是正向还是负向；
 - 当前视频最相近的纯正常场景 context；
-- 当前帧相对该 context 的标准化偏离；
-- 训练后该“通道—文本类别” gate、该文本类别 gain 和全局融合强度。
+- 当前帧相对该 context 的有符号状态偏离；
+- 当前帧相对该 context 的转移惊异度（该通道变化是否不符合正常运动）；
+- 训练后该“通道—文本类别”的 state gate、transition gate、显式语义校正和类别 rank-scale。
 
 因此，对某帧“为什么提高 shooting / explosion 概率”可以直接导出贡献最大的 `layer-dimension-text-direction`，而不是解释黑箱 residual 特征。`ctnc_vad.audit` 会逐视频写出这些证据。
 
@@ -60,18 +61,20 @@ softmax 后的类别概率与异常分数（排序/定位）
 
 小型 reader 仅学习：
 
-- 每个已发现的“通道—异常文本”对的一个 gate；
-- 每个异常文本类别的一个非负 gain；
-- 一个全局 hidden-evidence strength。
+- 每个已发现的“通道—异常文本”对的 state gate 和 transition gate；
+- 一个受冻结 CLIP 文本方向约束的、显式可导出的 state 校正量；
+- 每个异常文本类别的 state/transition 证据尺度和 rank-scale。
 
-同时，读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
+其中 state 是 hidden 相对正常 context 的有符号偏离，transition 是相对正常 context 的局部变化惊异度；两者都是逐帧、逐 `layer-dimension-text` 可分解的线性证据。读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
 
 ```text
+hidden_evidence(c) = state_scale(c) × state_evidence(c)
+                   + transition_scale(c) × transition_novelty_evidence(c)
 log p_final(c) = log p_frozen(c)
-               + strength × gain(c) × tanh(hidden_evidence(c))
+               + rank_scale(c) × hidden_evidence(c)
 ```
 
-随后对全部类别做 softmax。这样既能提高正确异常类别，也能压低与视频类别证据冲突的错误异常类别；最终 `1 - p_final(normal)` 用于帧级排序/定位，`p_final(all classes)` 用于 detection mAP。损失是视频级多类别 MIL + 正常视频帧约束 + 很小的冻结输出保持项 + gate 稀疏项。
+随后对全部类别做 softmax。这样既能提高正确异常类别，也能压低与视频类别证据冲突的错误异常类别；最终 `1 - p_final(normal)` 用于帧级排序/定位，`p_final(all classes)` 用于 detection mAP。损失是视频级多类别 MIL + 正常视频帧约束 + 很小的冻结输出保持项 + 双 gate 稀疏项 + 语义校正锚定项。
 
 ## 数据与目录约束
 
@@ -143,6 +146,7 @@ python -m ctnc_vad.train \
   --normal-frame-weight 0.25 \
   --preserve-weight 0.01 \
   --sparsity-weight 0.001 \
+  --semantic-anchor-weight 0.05 \
   --hidden-mil-weight 1.0 \
   --verification-initial-logit -1.5 \
   --alignment crop_hidden \

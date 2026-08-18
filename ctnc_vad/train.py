@@ -69,6 +69,10 @@ def main() -> None:
     parser.add_argument("--preserve-weight", type=float, default=0.01, help="Keep uncertain outputs close to the frozen baseline.")
     parser.add_argument("--sparsity-weight", type=float, default=1e-3)
     parser.add_argument(
+        "--semantic-anchor-weight", type=float, default=0.05,
+        help="Keep the explicit learned state correction near its frozen CLIP text-affinity prior.",
+    )
+    parser.add_argument(
         "--hidden-mil-weight", type=float, default=1.0,
         help="Video-label MIL supervision for the class-specific hidden circuit itself.",
     )
@@ -93,7 +97,10 @@ def main() -> None:
         raise ValueError("--clean and --resume cannot be used together")
     if args.max_epoch <= 0 or args.num_workers < 0 or args.scheduler_rate <= 0:
         parser.error("epochs and scheduler rate must be positive; workers may be zero")
-    if min(args.normal_frame_weight, args.preserve_weight, args.sparsity_weight, args.hidden_mil_weight) < 0:
+    if min(
+        args.normal_frame_weight, args.preserve_weight, args.sparsity_weight,
+        args.hidden_mil_weight, args.semantic_anchor_weight,
+    ) < 0:
         parser.error("loss weights must be non-negative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -173,7 +180,10 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.max_epoch):
         model.train()
-        totals = {"loss": 0.0, "bag": 0.0, "hidden_bag": 0.0, "normal": 0.0, "preserve": 0.0, "sparse": 0.0}
+        totals = {
+            "loss": 0.0, "bag": 0.0, "hidden_bag": 0.0, "normal": 0.0,
+            "preserve": 0.0, "sparse": 0.0, "semantic_anchor": 0.0,
+        }
         batches = 0
         progress = tqdm(train_loader, desc=f"CTNC train {epoch + 1}/{args.max_epoch}", unit="batch")
         for circuit, last_hidden, baseline_probability, lengths, class_targets in progress:
@@ -191,13 +201,14 @@ def main() -> None:
                 args.preserve_weight,
                 args.sparsity_weight,
                 args.hidden_mil_weight,
+                args.semantic_anchor_weight,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             batches += 1
             totals["loss"] += float(loss.detach())
-            for name in ("bag", "hidden_bag", "normal", "preserve", "sparse"):
+            for name in ("bag", "hidden_bag", "normal", "preserve", "sparse", "semantic_anchor"):
                 totals[name] += pieces[name]
             progress.set_postfix(
                 loss=f"{float(loss.detach()):.4f}",
@@ -226,6 +237,7 @@ def main() -> None:
             "normal_loss": totals["normal"] / max(1, batches),
             "preserve_loss": totals["preserve"] / max(1, batches),
             "gate_mean": totals["sparse"] / max(1, batches),
+            "semantic_anchor_loss": totals["semantic_anchor"] / max(1, batches),
             "baseline_ap2": float(validation["baseline"]["ap2"]),
             "evidence_auc": float(validation["channel_evidence_only"]["auc"]),
             "evidence_ap": float(validation["channel_evidence_only"]["ap"]),
