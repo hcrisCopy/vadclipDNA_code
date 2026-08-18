@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from ..common import atomic_save_npy, atomic_save_npz, load_json, save_json, write_csv
+from ..common import atomic_save_npy, atomic_save_npz, load_clip_feature, load_json, save_json, write_csv
 from .common import (
     CLIP_FEATURE_DIM,
     NORMAL_XD_LABEL,
