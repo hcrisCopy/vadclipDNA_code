@@ -268,11 +268,15 @@ class ChannelRankVerifier(nn.Module):
         # The direct hidden probe is the same declared evidence under a
         # class-wise logistic calibration, not an independent black-box head.
         hidden_temperature = F.softplus(self.hidden_temperature_logits)
-        hidden_probability = torch.sigmoid(
+        sparse_hidden_probability = torch.sigmoid(
             atoms["class_evidence"] * hidden_temperature.view(1, 1, -1)
             + self.hidden_bias.view(1, 1, -1)
         )
-        hidden_probability = torch.maximum(hidden_probability, semantic["semantic_probability"])
+        semantic_anomaly = 1.0 - (1.0 - semantic["semantic_probability"]).prod(dim=-1)
+        sparse_hidden_anomaly = (
+            1.0 - (1.0 - sparse_hidden_probability).prod(dim=-1)
+        ).masked_fill(~mask, 0.0)
+        hidden_probability = torch.maximum(sparse_hidden_probability, semantic["semantic_probability"])
         hidden_anomaly = (1.0 - (1.0 - hidden_probability).prod(dim=-1)).masked_fill(~mask, 0.0)
         result = {
             "score": verified,
@@ -283,6 +287,9 @@ class ChannelRankVerifier(nn.Module):
             "semantic_rank_scales": semantic_rank_scales,
             "hidden_anomaly": hidden_anomaly,
             "hidden_probability": hidden_probability,
+            "sparse_hidden_probability": sparse_hidden_probability,
+            "sparse_hidden_anomaly": sparse_hidden_anomaly,
+            "semantic_anomaly": semantic_anomaly.masked_fill(~mask, 0.0),
             # Aliases keep the evaluator contract stable.
             "gates": atoms["state_gates"].mean(dim=1),
             "class_gates": atoms["state_gates"],

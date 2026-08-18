@@ -164,7 +164,7 @@ python -m ctnc_vad.train \
   --clean
 ```
 
-每 epoch 会同时打印冻结 baseline 的官方 `AP2` 与 CTNC 后的 `AP2`。XD 当前正确的基线对齐值应为约 `0.845045`；这是保护评测序列顺序后的结果。最优 checkpoint 只按同一验证集上的官方 `AP2` 保存。
+每 epoch 会同时打印冻结 baseline 的官方 `AP2` 与 CTNC 后的 `AP2`，并分别打印稀疏正常性电路和全通道语义电路的 hidden-only AP。两者的联合分数不能代替单分支 AP：若某一分支在正常帧有系统性误报，应在后续局部重排中抑制它，而不是用“取最大值”掩盖问题。XD 当前正确的基线对齐值应为约 `0.845045`；这是保护评测序列顺序后的结果。最优 checkpoint 只按同一验证集上的官方 `AP2` 保存。
 
 测试最优 checkpoint：
 
@@ -203,7 +203,7 @@ python -m ctnc_vad.audit \
   --device cuda
 ```
 
-`audit/xd_test/circuit_dimensions.csv` 是稀疏通道字典；每个视频 `.npz` 还包含每帧的 `semantic_probability`，以及 `top_semantic_hidden_index_by_class` / `top_semantic_hidden_contribution_by_class`：它们直接给出全 final hidden 通道中支持各异常文本的维度及数值。
+`audit/xd_test/circuit_dimensions.csv` 是稀疏通道字典；每个视频 `.npz` 还包含每帧的 `semantic_probability`，以及 `top_semantic_hidden_index_by_class` / `top_semantic_hidden_contribution_by_class`：它们直接给出全 final hidden 通道中支持各异常文本的维度及数值。`evaluation/predictions/*.npz` 会分别保存联合 `evidence`、`sparse_evidence` 和 `semantic_evidence`，用于检查是哪一条可解释证据真正改善了定位。
 
 ## 评测公平性与开销
 

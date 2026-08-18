@@ -265,6 +265,8 @@ def main() -> None:
             "baseline_ap2": float(validation["baseline"]["ap2"]),
             "evidence_auc": float(validation["channel_evidence_only"]["auc"]),
             "evidence_ap": float(validation["channel_evidence_only"]["ap"]),
+            "sparse_evidence_ap": float(validation["sparse_evidence_only"]["ap"]),
+            "semantic_evidence_ap": float(validation["semantic_evidence_only"]["ap"]),
             "final_auc": float(final_metrics["auc2"]),
             "final_ap": float(final_metrics[selection_name]),
             "final_dmap": float(final_metrics["detection_map_average"]),
@@ -288,6 +290,7 @@ def main() -> None:
         print(
             f"epoch {epoch + 1}/{args.max_epoch} | loss={row['loss']:.5f} | "
             f"baseline AP2={row['baseline_ap2']:.6f} | hidden-only AUC/AP={row['evidence_auc']:.6f}/{row['evidence_ap']:.6f} | "
+            f"sparse/semantic AP={row['sparse_evidence_ap']:.6f}/{row['semantic_evidence_ap']:.6f} | "
             f"final AUC={row['final_auc']:.6f} {selection_name}={row['final_ap']:.6f} dMAP={row['final_dmap']:.2f}% | "
             f"best={best_metric:.6f}",
             flush=True,

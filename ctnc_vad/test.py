@@ -87,6 +87,7 @@ def main() -> None:
     print(
         f"baseline AUC2/AP2={metrics['baseline']['auc2']:.6f}/{metrics['baseline']['ap2']:.6f} | "
         f"channel AUC/AP={metrics['channel_evidence_only']['auc']:.6f}/{metrics['channel_evidence_only']['ap']:.6f} | "
+        f"sparse/semantic AP={metrics['sparse_evidence_only']['ap']:.6f}/{metrics['semantic_evidence_only']['ap']:.6f} | "
         f"verified AUC2/AP2={final['auc2']:.6f}/{final['ap2']:.6f} dMAP={final['detection_map_average']:.2f}%",
         flush=True,
     )

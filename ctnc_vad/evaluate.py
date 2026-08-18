@@ -21,7 +21,10 @@ def valid_prediction(path: Path, length: int) -> bool:
         try:
             return all(
                 name in artifact.files and len(artifact[name]) == length
-                for name in ("prob1", "prob2", "evidence", "verified", "prob2_all", "verified_all", "class_evidence")
+                for name in (
+                    "prob1", "prob2", "evidence", "sparse_evidence", "semantic_evidence",
+                    "verified", "prob2_all", "verified_all", "class_evidence",
+                )
             )
         finally:
             artifact.close()
@@ -47,6 +50,8 @@ def verifier_sequence(
     detail = {
         "context": outputs["context"].detach().cpu().numpy().astype(np.int64),
         "hidden_anomaly": outputs["hidden_anomaly"][0, :length].detach().cpu().numpy().astype(np.float32),
+        "sparse_hidden_anomaly": outputs["sparse_hidden_anomaly"][0, :length].detach().cpu().numpy().astype(np.float32),
+        "semantic_anomaly": outputs["semantic_anomaly"][0, :length].detach().cpu().numpy().astype(np.float32),
         "class_evidence": outputs["class_evidence"][0, :length].detach().cpu().numpy().astype(np.float32),
         "class_gains": outputs["class_gains"].detach().cpu().numpy().astype(np.float32),
         "verification_strength": outputs["verification_strength"].reshape(1).detach().cpu().numpy().astype(np.float32),
@@ -71,7 +76,11 @@ def collect_predictions(
 ) -> tuple[dict[str, list[np.ndarray]], list[str], list[list[object]]]:
     if prediction_dir is not None:
         prediction_dir.mkdir(parents=True, exist_ok=True)
-    output = {"prob1": [], "prob2": [], "prob2_all": [], "evidence": [], "verified": [], "verified_all": []}
+    output = {
+        "prob1": [], "prob2": [], "prob2_all": [], "evidence": [],
+        "sparse_evidence": [], "semantic_evidence": [],
+        "verified": [], "verified_all": [],
+    }
     labels: list[str] = []
     index_rows: list[list[object]] = []
     circuit_model.eval()
@@ -102,6 +111,8 @@ def collect_predictions(
                 "prob2": probability2,
                 "prob2_all": probability2_all,
                 "evidence": detail["hidden_anomaly"],
+                "sparse_evidence": detail["sparse_hidden_anomaly"],
+                "semantic_evidence": detail["semantic_anomaly"],
                 "verified": verified,
                 "verified_all": verified_all,
             }
@@ -126,6 +137,8 @@ def summarize_predictions(predictions: dict[str, list[np.ndarray]], labels: list
     return {
         "baseline": baseline.to_dict(),
         "channel_evidence_only": score_only_metrics(predictions["evidence"], gt),
+        "sparse_evidence_only": score_only_metrics(predictions["sparse_evidence"], gt),
+        "semantic_evidence_only": score_only_metrics(predictions["semantic_evidence"], gt),
         "rank_verified": rectified.to_dict(),
     }
 

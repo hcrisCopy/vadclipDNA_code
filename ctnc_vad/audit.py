@@ -45,6 +45,8 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
     semantic_values, semantic_indices = semantic_contribution[0, :length].topk(semantic_count, dim=-2)
     return {
         "hidden_anomaly": outputs["hidden_anomaly"][0, :length].cpu().numpy().astype(np.float32),
+        "sparse_hidden_anomaly": outputs["sparse_hidden_anomaly"][0, :length].cpu().numpy().astype(np.float32),
+        "semantic_anomaly": outputs["semantic_anomaly"][0, :length].cpu().numpy().astype(np.float32),
         "class_evidence": outputs["class_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "state_evidence": outputs["state_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "transition_evidence": outputs["transition_evidence"][0, :length].cpu().numpy().astype(np.float32),
