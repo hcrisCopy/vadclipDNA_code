@@ -197,8 +197,13 @@ def main() -> None:
             cross[layer] += centered[:, layer, :].T @ target
             second[layer] += np.square(centered[:, layer, :]).sum(axis=0)
     semantic_lens = cross / (second[..., None] + float(args.ridge))
+    # ``response[l,d,c]`` is signed: a positive (negative) activation change
+    # in hidden coordinate ``d`` moves layer ``l`` toward (away from) anomaly
+    # text concept ``c`` relative to normal text.  Keeping this sign is the
+    # key distinction from the old direction-free absolute deviation score.
     text_directions = text_features[1:] - text_features[:1]
-    semantic_score = np.abs(np.einsum("ldk,ck->ldc", semantic_lens, text_directions)).max(axis=-1).astype(np.float32)
+    semantic_response = np.einsum("ldk,ck->ldc", semantic_lens, text_directions).astype(np.float32)
+    semantic_score = np.abs(semantic_response).max(axis=-1).astype(np.float32)
 
     # Pass 3: weak bag statistics.  The tail is over a hidden coordinate, not a baseline prediction.
     normal_tail_sum = np.zeros((layers, width), dtype=np.float64)
@@ -223,6 +228,12 @@ def main() -> None:
     selected_layers = np.repeat(np.arange(layers, dtype=np.int64), args.candidate_per_layer)
     selected_dimensions = chosen_dims.reshape(-1).astype(np.int64)
     selected_width = len(selected_layers)
+    selected_affinity = semantic_response[selected_layers, selected_dimensions]
+    selected_text_class = np.abs(selected_affinity).argmax(axis=-1).astype(np.int64) + 1
+    selected_text_direction = np.sign(
+        selected_affinity[np.arange(selected_width), selected_text_class - 1]
+    ).astype(np.float32)
+    selected_text_direction[selected_text_direction == 0] = 1.0
 
     # Pass 4: scene-conditioned normal state and transition statistics in the sparse circuit only.
     contexts = len(context_centers)
@@ -258,7 +269,7 @@ def main() -> None:
     ))
 
     artifact = {
-        "version": 1,
+        "version": 2,
         "dataset": args.dataset,
         "hidden_layers": layers,
         "hidden_width": width,
@@ -267,6 +278,9 @@ def main() -> None:
         "clip_model": args.clip_model,
         "selected_layers": torch.from_numpy(selected_layers),
         "selected_dimensions": torch.from_numpy(selected_dimensions),
+        "selected_text_direction": torch.from_numpy(selected_text_direction),
+        "selected_text_class": torch.from_numpy(selected_text_class),
+        "selected_text_affinity": torch.from_numpy(selected_affinity),
         "context_centers": torch.from_numpy(context_centers),
         "state_mean": torch.from_numpy(state_mean.astype(np.float32)),
         "state_std": torch.from_numpy(state_std.astype(np.float32)),
@@ -284,13 +298,18 @@ def main() -> None:
     chosen_set = {(int(layer), int(dim)) for layer, dim in zip(selected_layers, selected_dimensions)}
     for layer in range(layers):
         for dim in range(width):
+            class_index = int(np.abs(semantic_response[layer, dim]).argmax()) + 1
+            direction = float(np.sign(semantic_response[layer, dim, class_index - 1]) or 1.0)
             table_rows.append([
                 layer + 1, dim, float(discriminative_score[layer, dim]), float(semantic_score[layer, dim]),
-                float(combined_score[layer, dim]), int((layer, dim) in chosen_set),
+                float(combined_score[layer, dim]), prompts[class_index], direction, int((layer, dim) in chosen_set),
             ])
     write_csv(
         output / "channel_scores.csv",
-        ["layer_1based", "dimension", "bag_discriminative", "semantic_lens", "combined", "selected"],
+        [
+            "layer_1based", "dimension", "bag_discriminative", "semantic_lens", "combined",
+            "dominant_anomaly_text", "signed_text_direction", "selected",
+        ],
         table_rows,
     )
     write_csv(output / "missing_hidden.csv", ["video_key", "label"], missing)
@@ -312,7 +331,7 @@ def main() -> None:
         "selected_width": selected_width,
         "candidate_per_layer": args.candidate_per_layer,
         "context_count": contexts,
-        "selection": "weak bag tail contrast plus frozen hidden-to-text semantic lens; no VadCLIP score is used",
+        "selection": "weak bag tail contrast plus signed frozen hidden-to-text semantic directions; no VadCLIP score is used",
         "assets": relpath(asset_path, output),
     })
     print(

@@ -9,7 +9,7 @@ import torch
 
 from .assets import load_assets
 from .baseline import build_frozen_baseline
-from .circuit import NormalityCircuit
+from .circuit import ChannelRankVerifier
 from .common import default_output_root, hidden_manifest_paths, save_json, stage_dir
 from .dataset import HiddenBagDataset
 from .evaluate import collect_predictions, summarize_predictions, write_prediction_index
@@ -25,7 +25,7 @@ def model_state(path: str | Path) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Resumable official-metric CTNC test with an unchanged frozen VadCLIP baseline.")
+    parser = argparse.ArgumentParser(description="Resumable official-metric CTNC hidden-channel verification with an unchanged frozen VadCLIP baseline.")
     parser.add_argument("--dataset", choices=["xd", "ucf"], required=True)
     parser.add_argument("--source-test-csv", required=True)
     parser.add_argument("--source-path-base", default=".")
@@ -41,16 +41,10 @@ def main() -> None:
     parser.add_argument("--gt-segment-path", required=True)
     parser.add_argument("--gt-label-path", required=True)
     parser.add_argument("--alignment", choices=["strict", "crop_hidden", "pad_hidden"], default="crop_hidden")
-    parser.add_argument("--rank-anchor-fraction", type=float, default=0.125)
-    parser.add_argument("--rank-margin", type=float, default=0.10)
-    parser.add_argument("--rank-strength", type=float, default=0.25)
-    parser.add_argument("--rank-steps", type=int, default=3)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--clean", action="store_true", help="Delete and rebuild only evaluation/ under --output-root.")
     parser.add_argument("--no-resume", action="store_true", help="Recompute valid per-video prediction artifacts.")
     args = parser.parse_args()
-    if not 0 < args.rank_anchor_fraction <= 0.5 or min(args.rank_margin, args.rank_strength) < 0 or args.rank_steps < 0:
-        parser.error("invalid rank-rectification arguments")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
@@ -70,14 +64,13 @@ def main() -> None:
         args.dataset, args.source_test_csv, args.source_path_base, hidden, selected_layers, selected_dimensions,
         options.visual_length, False, args.alignment, False,
     )
-    circuit = NormalityCircuit(assets).to(device)
-    circuit.load_state_dict(model_state(args.model_path), strict=True)
+    verifier = ChannelRankVerifier(assets).to(device)
+    verifier.load_state_dict(model_state(args.model_path), strict=True)
     gt = np.load(args.gt_path)
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
     predictions, labels, rows = collect_predictions(
-        circuit, test_set, baseline, options.visual_length, args.dataset, device,
-        args.rank_anchor_fraction, args.rank_margin, args.rank_strength, args.rank_steps,
+        verifier, test_set, baseline, options.visual_length, args.dataset, device,
         output / "predictions", not args.no_resume, "CTNC test",
     )
     metrics = summarize_predictions(predictions, labels, gt, gtsegments, gtlabels, args.dataset)
@@ -88,16 +81,13 @@ def main() -> None:
         "assets": args.assets,
         "model_path": args.model_path,
         "baseline_checkpoint": args.init_baseline_model,
-        "rank_rectification": {
-            "anchor_fraction": args.rank_anchor_fraction, "margin": args.rank_margin,
-            "strength": args.rank_strength, "steps": args.rank_steps,
-        },
+        "verification": "signed hidden-channel evidence selects keep, suppress, or promote actions over frozen baseline scores",
     })
-    final = metrics["rank_rectified"]
+    final = metrics["rank_verified"]
     print(
         f"baseline AUC2/AP2={metrics['baseline']['auc2']:.6f}/{metrics['baseline']['ap2']:.6f} | "
-        f"circuit AUC/AP={metrics['circuit_only']['auc']:.6f}/{metrics['circuit_only']['ap']:.6f} | "
-        f"rectified AUC2/AP2={final['auc2']:.6f}/{final['ap2']:.6f} dMAP={final['detection_map_average']:.2f}%",
+        f"channel AUC/AP={metrics['channel_evidence_only']['auc']:.6f}/{metrics['channel_evidence_only']['ap']:.6f} | "
+        f"verified AUC2/AP2={final['auc2']:.6f}/{final['ap2']:.6f} dMAP={final['detection_map_average']:.2f}%",
         flush=True,
     )
 

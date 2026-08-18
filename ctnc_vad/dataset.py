@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .baseline_cache import load_cached_probability
 from .common import (
     align_hidden,
     base_key,
@@ -46,6 +47,7 @@ class HiddenBagDataset(Dataset):
         training: bool,
         alignment: str,
         allow_missing_hidden: bool = False,
+        baseline_scores_by_key: dict[str, Path] | None = None,
     ) -> None:
         self.dataset = dataset
         self.source_csv = Path(source_csv)
@@ -57,13 +59,14 @@ class HiddenBagDataset(Dataset):
         self.training = bool(training)
         self.alignment = alignment
         self.normal = normal_label(dataset)
+        self.baseline_scores_by_key = baseline_scores_by_key or {}
         groups = grouped_source_rows(read_source_csv(self.source_csv))
         self.items: list[dict[str, object]] = []
         self.skipped: list[str] = []
         for key, group in groups.items():
             hidden_path = hidden_by_key.get(key)
             if hidden_path is None:
-                if allow_missing_hidden and self.training:
+                if allow_missing_hidden:
                     self.skipped.append(key)
                     continue
                 raise FileNotFoundError(f"{key}: no hidden state found in the supplied manifest")
@@ -86,26 +89,34 @@ class HiddenBagDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def _load(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _load(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
         item = self.items[index]
         hidden = load_hidden(item["hidden_path"])
         feature = load_clip_feature(item["feature_path"])
         hidden, _action = align_hidden(hidden, len(feature), self.alignment)
         circuit = select_circuit(hidden, self.selected_layers, self.selected_dimensions)
         last_hidden = hidden[:, -1, :].astype(np.float32, copy=False)
-        return circuit, last_hidden, feature
+        score_path = self.baseline_scores_by_key.get(str(item["key"]))
+        baseline_score = None if score_path is None else load_cached_probability(score_path, len(feature))
+        return circuit, last_hidden, feature, baseline_score
 
     def __getitem__(self, index: int):
         item = self.items[index]
-        circuit, last_hidden, feature = self._load(index)
+        circuit, last_hidden, feature, baseline_score = self._load(index)
         if self.training:
             circuit, valid_length = resample_for_train(circuit, self.visual_length)
             last_hidden, valid_last_length = resample_for_train(last_hidden, self.visual_length)
             if valid_length != valid_last_length:
                 raise RuntimeError("circuit and final hidden resampling disagree")
+            if baseline_score is None:
+                raise RuntimeError("training the CTNC verifier requires cached frozen-baseline scores")
+            baseline_score, valid_score_length = resample_for_train(baseline_score[:, None], self.visual_length)
+            if valid_length != valid_score_length:
+                raise RuntimeError("circuit and frozen-baseline score resampling disagree")
             return (
                 torch.from_numpy(circuit),
                 torch.from_numpy(last_hidden),
+                torch.from_numpy(baseline_score[:, 0]),
                 torch.tensor(valid_length, dtype=torch.int64),
                 torch.tensor(0 if is_normal_video(self.dataset, str(item["label"])) else 1, dtype=torch.float32),
             )

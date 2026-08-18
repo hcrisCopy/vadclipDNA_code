@@ -10,7 +10,7 @@ import torch
 from tqdm import tqdm
 
 from .assets import load_assets
-from .circuit import NormalityCircuit
+from .circuit import ChannelRankVerifier
 from .common import atomic_save_npz, default_output_root, hidden_manifest_paths, stage_dir, write_csv
 from .dataset import HiddenBagDataset
 
@@ -25,20 +25,23 @@ def model_state(path: str | Path) -> dict:
 
 
 @torch.no_grad()
-def evidence_for_video(model: NormalityCircuit, item: dict, device: torch.device, topk: int) -> dict[str, np.ndarray]:
+def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.device, topk: int) -> dict[str, np.ndarray]:
     length = int(item["length"])
+    # Audit concerns hidden-channel evidence. It therefore uses an uninformative
+    # 0.5 baseline prior and does not alter any VAD score or baseline weight.
     outputs = model(
         item["circuit"].unsqueeze(0).to(device),
         item["last_hidden"].unsqueeze(0).to(device),
+        torch.full((1, length), 0.5, dtype=torch.float32, device=device),
         torch.tensor([length], dtype=torch.int64, device=device),
     )
-    contribution = outputs["dimension_state"] + outputs["dimension_transition"]
+    contribution = outputs["channel_evidence"].abs()
     count = min(int(topk), contribution.shape[-1])
     values, indices = contribution[0, :length].topk(count, dim=-1)
     return {
-        "circuit_score": outputs["score"][0, :length].cpu().numpy().astype(np.float32),
-        "state_score": outputs["state_score"][0, :length].cpu().numpy().astype(np.float32),
-        "transition_score": outputs["transition_score"][0, :length].cpu().numpy().astype(np.float32),
+        "signed_evidence": outputs["signed_evidence"][0, :length].cpu().numpy().astype(np.float32),
+        "layer_evidence": outputs["layer_evidence"][0, :length].cpu().numpy().astype(np.float32),
+        "agreement": outputs["agreement"][0, :length].cpu().numpy().astype(np.float32),
         "text_margin": outputs["text_margin"][0, :length].cpu().numpy().astype(np.float32),
         "text_similarity": outputs["text_similarity"][0, :length].cpu().numpy().astype(np.float32),
         "normal_context": outputs["context"].cpu().numpy().astype(np.int64),
@@ -92,7 +95,7 @@ def main() -> None:
         visual_length=256, training=False, alignment=args.alignment, allow_missing_hidden=False,
     )
     device = torch.device(args.device)
-    model = NormalityCircuit(assets).to(device)
+    model = ChannelRankVerifier(assets).to(device)
     model.load_state_dict(model_state(args.model_path), strict=True)
     rows: list[list[object]] = []
     for item in tqdm(dataset, desc=f"CTNC audit {args.split_name}", unit="video"):
@@ -103,13 +106,22 @@ def main() -> None:
         evidence = evidence_for_video(model, item, device, args.topk)
         evidence["selected_layers"] = selected_layers.astype(np.int64)
         evidence["selected_dimensions"] = selected_dimensions.astype(np.int64)
+        evidence["selected_text_direction"] = assets["selected_text_direction"].cpu().numpy().astype(np.float32)
+        evidence["selected_text_class"] = assets["selected_text_class"].cpu().numpy().astype(np.int64)
         atomic_save_npz(target, **evidence)
         rows.append([item["key"], item["label"], item["length"], target.name, "new"])
     write_csv(output / "index.csv", ["video_key", "label", "length", "audit_file", "action"], rows)
     write_csv(
         output / "circuit_dimensions.csv",
-        ["circuit_index", "layer_1based", "dimension"],
-        [[index, int(layer) + 1, int(dimension)] for index, (layer, dimension) in enumerate(zip(selected_layers, selected_dimensions))],
+        ["circuit_index", "layer_1based", "dimension", "anomaly_text", "signed_direction"],
+        [
+            [
+                index, int(layer) + 1, int(dimension),
+                assets["prompts"][int(assets["selected_text_class"][index])],
+                float(assets["selected_text_direction"][index]),
+            ]
+            for index, (layer, dimension) in enumerate(zip(selected_layers, selected_dimensions))
+        ],
     )
     print(f"wrote {len(rows)} resumable explanation artifacts under {output}", flush=True)
 

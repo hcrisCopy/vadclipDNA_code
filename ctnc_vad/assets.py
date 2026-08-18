@@ -8,6 +8,7 @@ import torch
 
 REQUIRED_KEYS = {
     "version", "dataset", "hidden_layers", "hidden_width", "selected_layers", "selected_dimensions",
+    "selected_text_direction", "selected_text_class", "selected_text_affinity",
     "context_centers", "state_mean", "state_std", "transition_mean", "transition_std",
     "ln_post_weight", "ln_post_bias", "ln_post_eps", "visual_projection", "text_features",
 }
@@ -29,6 +30,13 @@ def load_assets(path: str | Path, device: torch.device | str = "cpu") -> dict:
     if int(artifact["hidden_width"]) != 768:
         raise ValueError(f"{path}: current CLIP contract requires hidden width 768")
     selected_width = len(layers)
+    for key in ("selected_text_direction", "selected_text_class"):
+        value = artifact[key]
+        if not isinstance(value, torch.Tensor) or value.ndim != 1 or len(value) != selected_width:
+            raise ValueError(f"{path}: {key} must have shape [{selected_width}]")
+    affinity = artifact["selected_text_affinity"]
+    if not isinstance(affinity, torch.Tensor) or affinity.ndim != 2 or affinity.shape[0] != selected_width:
+        raise ValueError(f"{path}: selected_text_affinity must have shape [{selected_width}, anomaly_classes]")
     for key in ("state_mean", "state_std", "transition_mean", "transition_std"):
         value = artifact[key]
         if not isinstance(value, torch.Tensor) or value.ndim != 2 or value.shape[1] != selected_width:

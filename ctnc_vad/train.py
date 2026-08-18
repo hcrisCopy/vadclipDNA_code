@@ -12,7 +12,8 @@ from tqdm import tqdm
 
 from .assets import load_assets
 from .baseline import build_frozen_baseline
-from .circuit import NormalityCircuit, circuit_loss
+from .baseline_cache import prepare_score_cache
+from .circuit import ChannelRankVerifier, verifier_loss
 from .common import (
     atomic_torch_save,
     default_output_root,
@@ -28,7 +29,10 @@ from .evaluate import collect_predictions, summarize_predictions
 
 
 def dataset_defaults(dataset: str) -> tuple[int, float, list[int]]:
-    return (96, 1e-5, [3, 6, 10]) if dataset == "xd" else (64, 2e-5, [4, 8])
+    # VadCLIP keeps its original learning rate. This is the separate, tiny
+    # CTNC verifier (roughly hundreds of trainable scalars), so it needs a
+    # reader-scale rate rather than the baseline full-model fine-tuning rate.
+    return (96, 1e-3, [6, 9]) if dataset == "xd" else (64, 1e-3, [6, 9])
 
 
 def checkpoint_state(path: Path) -> dict:
@@ -62,13 +66,11 @@ def main() -> None:
     parser.add_argument("--scheduler-rate", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--normal-frame-weight", type=float, default=0.25)
+    parser.add_argument("--preserve-weight", type=float, default=0.02, help="Keep uncertain outputs close to the frozen baseline.")
     parser.add_argument("--sparsity-weight", type=float, default=1e-3)
     parser.add_argument("--gate-initial-logit", type=float, default=0.0)
+    parser.add_argument("--keep-initial-logit", type=float, default=5.0, help="Initial preference for no score change.")
     parser.add_argument("--alignment", choices=["strict", "crop_hidden", "pad_hidden"], default="crop_hidden")
-    parser.add_argument("--rank-anchor-fraction", type=float, default=0.125)
-    parser.add_argument("--rank-margin", type=float, default=0.10)
-    parser.add_argument("--rank-strength", type=float, default=0.25)
-    parser.add_argument("--rank-steps", type=int, default=3)
     parser.add_argument("--seed", type=int, default=234)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -77,14 +79,15 @@ def main() -> None:
         help="Fail when a training video is absent from the train hidden manifest. The default is to skip and record only those training videos.",
     )
     parser.add_argument("--resume", action="store_true", help="Resume exactly from training/checkpoint_last.pth.")
+    parser.add_argument("--no-resume-baseline-cache", action="store_true", help="Recompute frozen-baseline training scores.")
     parser.add_argument("--clean", action="store_true", help="Delete and rebuild only training/ under --output-root.")
     args = parser.parse_args()
     if args.clean and args.resume:
         raise ValueError("--clean and --resume cannot be used together")
     if args.max_epoch <= 0 or args.num_workers < 0 or args.scheduler_rate <= 0:
         parser.error("epochs and scheduler rate must be positive; workers may be zero")
-    if min(args.normal_frame_weight, args.sparsity_weight, args.rank_margin, args.rank_strength) < 0 or not 0 < args.rank_anchor_fraction <= 0.5:
-        parser.error("loss and rank weights must be non-negative")
+    if min(args.normal_frame_weight, args.preserve_weight, args.sparsity_weight) < 0:
+        parser.error("loss weights must be non-negative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
@@ -112,9 +115,21 @@ def main() -> None:
     )
     device = torch.device(args.device)
     baseline, options = build_frozen_baseline(args.dataset, args.init_baseline_model, device)
+    # This inference-only dataset preserves the original source order and
+    # lets us cache baseline scores once. Scores are reader inputs, never MIL
+    # pseudo-labels or channel-discovery targets.
+    cache_reference = HiddenBagDataset(
+        args.dataset, args.source_train_csv, args.source_path_base, train_hidden, selected_layers, selected_dimensions,
+        options.visual_length, False, args.alignment, not args.strict_train_hidden_manifest,
+    )
+    cache_dir = output.parent / "baseline_cache" / "train"
+    cached_scores = prepare_score_cache(
+        cache_reference, baseline, options.visual_length, args.dataset, device, cache_dir,
+        reuse=not args.no_resume_baseline_cache, progress="Cache frozen baseline train scores",
+    )
     train_set = HiddenBagDataset(
         args.dataset, args.source_train_csv, args.source_path_base, train_hidden, selected_layers, selected_dimensions,
-        options.visual_length, True, args.alignment, not args.strict_train_hidden_manifest,
+        options.visual_length, True, args.alignment, not args.strict_train_hidden_manifest, cached_scores,
     )
     test_set = HiddenBagDataset(
         args.dataset, args.source_test_csv, args.source_path_base, test_hidden, selected_layers, selected_dimensions,
@@ -130,7 +145,7 @@ def main() -> None:
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda"
     )
-    model = NormalityCircuit(assets, args.gate_initial_logit).to(device)
+    model = ChannelRankVerifier(assets, args.gate_initial_logit, args.keep_initial_logit).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = MultiStepLR(optimizer, args.scheduler_milestones, args.scheduler_rate)
     gt = np.load(args.gt_path)
@@ -151,34 +166,36 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.max_epoch):
         model.train()
-        totals = {"loss": 0.0, "bag": 0.0, "normal": 0.0, "sparse": 0.0}
+        totals = {"loss": 0.0, "bag": 0.0, "normal": 0.0, "preserve": 0.0, "sparse": 0.0}
         batches = 0
         progress = tqdm(train_loader, desc=f"CTNC train {epoch + 1}/{args.max_epoch}", unit="batch")
-        for circuit, last_hidden, lengths, labels in progress:
+        for circuit, last_hidden, baseline_score, lengths, labels in progress:
             circuit = circuit.to(device, non_blocking=True)
             last_hidden = last_hidden.to(device, non_blocking=True)
+            baseline_score = baseline_score.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            outputs = model(circuit, last_hidden, lengths)
-            loss, pieces = circuit_loss(outputs, labels, lengths, args.normal_frame_weight, args.sparsity_weight)
+            outputs = model(circuit, last_hidden, baseline_score, lengths)
+            loss, pieces = verifier_loss(
+                outputs, labels, lengths, args.normal_frame_weight, args.preserve_weight, args.sparsity_weight
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             batches += 1
             totals["loss"] += float(loss.detach())
-            for name in ("bag", "normal", "sparse"):
+            for name in ("bag", "normal", "preserve", "sparse"):
                 totals[name] += pieces[name]
-            progress.set_postfix(loss=f"{float(loss.detach()):.4f}", gates=f"{float(outputs['gates'].detach().mean()):.3f}")
+            progress.set_postfix(loss=f"{float(loss.detach()):.4f}", keep=f"{float(outputs['keep'].detach().mean()):.3f}")
         scheduler.step()
 
         # Same model mode and official frame metrics as VadCLIP; the frozen baseline is deliberately re-evaluated.
         predictions, labels, _rows = collect_predictions(
             model, test_set, baseline, options.visual_length, args.dataset, device,
-            args.rank_anchor_fraction, args.rank_margin, args.rank_strength, args.rank_steps,
             prediction_dir=None, reuse_predictions=False, progress=f"CTNC validate {epoch + 1}/{args.max_epoch}",
         )
         validation = summarize_predictions(predictions, labels, gt, gtsegments, gtlabels, args.dataset)
-        final_metrics = validation["rank_rectified"]
+        final_metrics = validation["rank_verified"]
         selection_name = "ap2" if args.dataset == "xd" else "ap1"
         metric = float(final_metrics[selection_name])
         improved = metric > best_metric
@@ -190,10 +207,11 @@ def main() -> None:
             "loss": totals["loss"] / max(1, batches),
             "bag_loss": totals["bag"] / max(1, batches),
             "normal_loss": totals["normal"] / max(1, batches),
+            "preserve_loss": totals["preserve"] / max(1, batches),
             "gate_mean": totals["sparse"] / max(1, batches),
             "baseline_ap2": float(validation["baseline"]["ap2"]),
-            "circuit_auc": float(validation["circuit_only"]["auc"]),
-            "circuit_ap": float(validation["circuit_only"]["ap"]),
+            "evidence_auc": float(validation["channel_evidence_only"]["auc"]),
+            "evidence_ap": float(validation["channel_evidence_only"]["ap"]),
             "final_auc": float(final_metrics["auc2"]),
             "final_ap": float(final_metrics[selection_name]),
             "final_dmap": float(final_metrics["detection_map_average"]),
@@ -216,7 +234,7 @@ def main() -> None:
         save_json(output / "validation_last.json", validation)
         print(
             f"epoch {epoch + 1}/{args.max_epoch} | loss={row['loss']:.5f} | "
-            f"baseline AP2={row['baseline_ap2']:.6f} | circuit AUC/AP={row['circuit_auc']:.6f}/{row['circuit_ap']:.6f} | "
+            f"baseline AP2={row['baseline_ap2']:.6f} | channel AUC/AP={row['evidence_auc']:.6f}/{row['evidence_ap']:.6f} | "
             f"final AUC={row['final_auc']:.6f} {selection_name}={row['final_ap']:.6f} dMAP={row['final_dmap']:.2f}% | "
             f"best={best_metric:.6f}",
             flush=True,
@@ -230,6 +248,7 @@ def main() -> None:
         "train_videos": len(train_set),
         "test_videos": len(test_set),
         "skipped_train_hidden": train_set.skipped,
+        "baseline_cache": str(cache_dir),
     })
     print(f"training complete; best frozen-baseline sidecar is {best_path}", flush=True)
 
