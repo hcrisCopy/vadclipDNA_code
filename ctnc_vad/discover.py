@@ -240,6 +240,9 @@ def main() -> None:
     context_centers, context_assignments = kmeans_unit_vectors(
         np.stack(signatures), args.context_count, args.context_iters, args.seed
     )
+    # kmeans may reduce the requested count when the normal set has fewer
+    # distinct samples.  Use the actual number throughout gallery creation.
+    contexts = int(context_centers.shape[0])
     context_of_normal = {key: int(context) for key, context in zip(normal_keys, context_assignments)}
 
     prompts = list(labels_for_dataset(args.dataset).values())
