@@ -15,11 +15,13 @@ CTNC 将每个最终分数的变化分解为可检查的链条：
                     +
 多层 CLIP hidden state [T, 12, 768]
                     |
-离线发现：层 / 通道 / 对应异常文本 / 正负方向
+       ┌────────────┴────────────┐
+稀疏正常性电路                 全 final-layer 语义电路
+384 个层-通道-文本原子          768 个 hidden 通道 → 冻结 CLIP visual/text 路径
+正常原型偏离 + 转移惊异          每个异常文本的显式线性方向（有文本先验锚定）
+       └────────────┬────────────┘
                     |
-测试时：检索相似正常帧原型后的反事实状态偏离 + 状态转移惊异度
-                    |
-每个文本类别各自得到 hidden evidence
+每个文本类别各自得到可审计的 hidden evidence
                     |
 log p_frozen(class) + hidden likelihood factor(class)
                     |
@@ -30,7 +32,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 
 ## 为什么可解释
 
-每一个保留通道都有固定元数据：
+解释分成两类、互补的证据。稀疏正常性电路中每一个保留通道都有固定元数据：
 
 - CLIP 层号和 hidden 维度；
 - 它经冻结 CLIP `hidden → visual projection → text` 路径与哪一个异常文本最相关；
@@ -41,6 +43,8 @@ softmax 后的类别概率与异常分数（排序/定位）
 - 训练后该“通道—文本类别”的 state gate、transition gate、显式语义校正和类别 rank-scale。
 
 因此，对某帧“为什么提高 shooting / explosion 概率”可以直接导出贡献最大的 `layer-dimension-text-direction`，而不是解释黑箱 residual 特征。`ctnc_vad.audit` 会逐视频写出这些证据。
+
+全通道语义电路则复用 CLIP 原始的 `LayerNorm → visual projection → text direction` 路径。它不训练视觉编码器；每个异常文本只学习相对冻结文本方向的小校正，并将任一帧的 semantic logit 分摊回 768 个 final hidden 通道（包含 projection 归一化）。因此既能解释“哪个稀疏通道偏离正常原型”，也能解释“哪些 CLIP 内部维度正在支持 shooting / explosion 这个文本概念”。
 
 ## 两个阶段
 
@@ -64,17 +68,19 @@ softmax 后的类别概率与异常分数（排序/定位）
 - 每个已发现的“通道—异常文本”对的 state gate 和 transition gate；
 - 一个受冻结 CLIP 文本方向约束的、显式可导出的 state 校正量；
 - 每个异常文本类别的 state/transition 证据尺度和 rank-scale。
+- 每个异常文本在冻结 CLIP final visual space 的显式方向校正、先验和语义 rank-scale；这条分支覆盖全部 768 个 final hidden 通道。
 
 其中 state 是 hidden 相对**最近的真实正常原型**的有符号偏离，transition 是相对正常 context 的局部变化惊异度；两者都是逐帧、逐 `layer-dimension-text` 可分解的线性证据。原型检索避免把同一场景中的不同正常姿态、镜头或运动模式粗暴压成一个均值。读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
 
 ```text
-hidden_evidence(c) = state_scale(c) × state_evidence(c)
-                   + transition_scale(c) × transition_novelty_evidence(c)
+hidden_evidence(c) = sparse_rank_scale(c) × [state_scale(c) × state_evidence(c)
+                                             + transition_scale(c) × transition_novelty_evidence(c)]
+                   + semantic_rank_scale(c) × semantic_probability(c)
 log p_final(c) = log p_frozen(c)
-               + rank_scale(c) × hidden_evidence(c)
+               + hidden_evidence(c)
 ```
 
-随后对全部类别做 softmax。这样既能提高正确异常类别，也能压低与视频类别证据冲突的错误异常类别；最终 `1 - p_final(normal)` 用于帧级排序/定位，`p_final(all classes)` 用于 detection mAP。损失是视频级多类别 MIL + 正常视频帧约束 + 很小的冻结输出保持项 + 双 gate 稀疏项 + 语义校正锚定项。
+随后对全部类别做 softmax。这样既能提高正确异常类别，也能压低与视频类别证据冲突的错误异常类别；最终 `1 - p_final(normal)` 用于帧级排序/定位，`p_final(all classes)` 用于 detection mAP。损失包含冻结后输出的 MIL、稀疏正常性电路的 direct MIL、全通道语义电路的 direct MIL、正常视频帧约束、很小的冻结输出保持项、双 gate 稀疏项和文本方向锚定项。全通道语义电路必须单独预测视频原始类别，不能只是跟随 baseline。
 
 ## 数据与目录约束
 
@@ -150,7 +156,7 @@ python -m ctnc_vad.train \
   --sparsity-weight 0.001 \
   --semantic-anchor-weight 0.05 \
   --hidden-mil-weight 1.0 \
-  --verification-initial-logit -1.5 \
+  --verification-initial-logit -3.0 \
   --alignment crop_hidden \
   --seed 234 \
   --device cuda \
@@ -196,7 +202,7 @@ python -m ctnc_vad.audit \
   --device cuda
 ```
 
-`audit/xd_test/circuit_dimensions.csv` 是通道字典；每个视频 `.npz` 包含每帧各异常文本的 `class_evidence`、匹配的正常原型编号、原型残差，以及每类贡献最大的通道索引和数值。
+`audit/xd_test/circuit_dimensions.csv` 是稀疏通道字典；每个视频 `.npz` 还包含每帧的 `semantic_probability`，以及 `top_semantic_hidden_index_by_class` / `top_semantic_hidden_contribution_by_class`：它们直接给出全 final hidden 通道中支持各异常文本的维度及数值。
 
 ## 评测公平性与开销
 

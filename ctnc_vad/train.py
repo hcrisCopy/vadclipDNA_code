@@ -70,16 +70,16 @@ def main() -> None:
     parser.add_argument("--sparsity-weight", type=float, default=1e-3)
     parser.add_argument(
         "--semantic-anchor-weight", type=float, default=0.05,
-        help="Keep the explicit learned state correction near its frozen CLIP text-affinity prior.",
+        help="Keep state and all-channel text-direction corrections near their frozen CLIP priors.",
     )
     parser.add_argument(
         "--hidden-mil-weight", type=float, default=1.0,
-        help="Video-label MIL supervision for the class-specific hidden circuit itself.",
+        help="Video-label MIL supervision for both sparse and all-channel hidden circuits.",
     )
     parser.add_argument("--gate-initial-logit", type=float, default=0.0)
     parser.add_argument(
-        "--verification-initial-logit", type=float, default=-1.5,
-        help="Initial hidden-evidence strength after sigmoid; -1.5 starts at about 0.18.",
+        "--verification-initial-logit", type=float, default=-3.0,
+        help="Initial sparse-circuit likelihood scale after sigmoid; -3 starts at about 0.05.",
     )
     parser.add_argument("--alignment", choices=["strict", "crop_hidden", "pad_hidden"], default="crop_hidden")
     parser.add_argument("--seed", type=int, default=234)
@@ -182,6 +182,7 @@ def main() -> None:
         model.train()
         totals = {
             "loss": 0.0, "bag": 0.0, "hidden_bag": 0.0, "normal": 0.0,
+            "semantic_bag": 0.0, "semantic_normal": 0.0,
             "preserve": 0.0, "sparse": 0.0, "semantic_anchor": 0.0,
         }
         batches = 0
@@ -208,7 +209,10 @@ def main() -> None:
             optimizer.step()
             batches += 1
             totals["loss"] += float(loss.detach())
-            for name in ("bag", "hidden_bag", "normal", "preserve", "sparse", "semantic_anchor"):
+            for name in (
+                "bag", "hidden_bag", "semantic_bag", "normal", "semantic_normal",
+                "preserve", "sparse", "semantic_anchor",
+            ):
                 totals[name] += pieces[name]
             progress.set_postfix(
                 loss=f"{float(loss.detach()):.4f}",
@@ -234,7 +238,9 @@ def main() -> None:
             "loss": totals["loss"] / max(1, batches),
             "bag_loss": totals["bag"] / max(1, batches),
             "hidden_bag_loss": totals["hidden_bag"] / max(1, batches),
+            "semantic_bag_loss": totals["semantic_bag"] / max(1, batches),
             "normal_loss": totals["normal"] / max(1, batches),
+            "semantic_normal_loss": totals["semantic_normal"] / max(1, batches),
             "preserve_loss": totals["preserve"] / max(1, batches),
             "gate_mean": totals["sparse"] / max(1, batches),
             "semantic_anchor_loss": totals["semantic_anchor"] / max(1, batches),

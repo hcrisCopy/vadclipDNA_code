@@ -47,7 +47,7 @@ class ChannelRankVerifier(nn.Module):
         self,
         assets: dict,
         gate_initial_logit: float = 0.0,
-        verification_initial_logit: float = -1.5,
+        verification_initial_logit: float = -3.0,
     ) -> None:
         super().__init__()
         width = asset_selected_width(assets)
@@ -73,6 +73,16 @@ class ChannelRankVerifier(nn.Module):
         self.register_buffer("selected_layers", assets["selected_layers"].long())
         self.register_buffer("selected_text_direction", assets["selected_text_direction"].float())
         self.register_buffer("selected_text_class", assets["selected_text_class"].long())
+        self.register_buffer("ln_post_weight", assets["ln_post_weight"].float())
+        self.register_buffer("ln_post_bias", assets["ln_post_bias"].float())
+        self.register_buffer("visual_projection", assets["visual_projection"].float())
+        self.ln_post_eps = float(assets["ln_post_eps"])
+        text_features = assets["text_features"].float()
+        if text_features.shape != (self.class_count, 512):
+            raise ValueError(f"text_features must have shape [{self.class_count},512], got {tuple(text_features.shape)}")
+        # Exact frozen CLIP visual-space directions: every learned adjustment
+        # remains an explicit displacement from these text directions.
+        self.register_buffer("semantic_text_prior", (text_features[1:] - text_features[:1]).t())
 
         # RMS normalization preserves the frozen signed semantic direction but
         # avoids an L1 denominator shrinking hundreds of atoms to zero.
@@ -104,6 +114,17 @@ class ChannelRankVerifier(nn.Module):
             torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
         )
         self.hidden_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -2.0))
+        # This all-channel semantic circuit does not learn a new visual
+        # encoder. It reads the already-frozen final CLIP visual embedding and
+        # learns one auditable correction vector per anomaly text.
+        self.semantic_correction = nn.Parameter(torch.zeros(512, self.anomaly_class_count))
+        self.semantic_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -2.0))
+        self.semantic_rank_scale_logits = nn.Parameter(
+            # Start the semantic reader at a visible but still conservative
+            # likelihood factor.  Its direct MIL loss determines whether it
+            # should increase or decrease from this prior.
+            torch.full((self.anomaly_class_count,), inverse_softplus(0.20))
+        )
 
     def _context_indices(self, last_hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         signature = F.normalize(masked_mean(last_hidden, mask), dim=-1, eps=1e-6)
@@ -174,6 +195,43 @@ class ChannelRankVerifier(nn.Module):
             "transition_scales": transition_scales,
         }
 
+    def _semantic_circuit(self, last_hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Read the exact frozen CLIP final route with explicit text directions.
+
+        This branch covers every final-layer hidden coordinate, complementing
+        the sparse multi-layer normality circuit.  Its only learnable matrix
+        is a per-text correction to the frozen visual--text direction, so a
+        final semantic score can be expanded back to hidden coordinates.
+        """
+        mean = last_hidden.mean(dim=-1, keepdim=True)
+        variance = (last_hidden - mean).square().mean(dim=-1, keepdim=True)
+        ln_hidden = (last_hidden - mean) / torch.sqrt(variance + self.ln_post_eps)
+        post_hidden = ln_hidden * self.ln_post_weight + self.ln_post_bias
+        projected = post_hidden @ self.visual_projection
+        projection_norm = projected.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        visual = projected / projection_norm
+        semantic_weights = 4.0 * self.semantic_text_prior + self.semantic_correction
+        semantic_logit = torch.einsum("btd,dc->btc", visual, semantic_weights) + self.semantic_bias.view(1, 1, -1)
+        semantic_probability = torch.sigmoid(semantic_logit)
+        # Before the final L2 normalization, this is the exact linear map from
+        # a LayerNorm hidden coordinate to each text direction.  It is stored
+        # for channel-level explanation rather than treated as a black box.
+        hidden_text_weight = (self.ln_post_weight.unsqueeze(1) * self.visual_projection) @ semantic_weights
+        return {
+            "semantic_visual": visual,
+            "semantic_logit": semantic_logit,
+            "semantic_probability": semantic_probability,
+            "semantic_weights": semantic_weights,
+            "semantic_text_prior": self.semantic_text_prior,
+            "semantic_hidden_weight": hidden_text_weight,
+            "semantic_ln_hidden": ln_hidden,
+            "semantic_projection_norm": projection_norm,
+            "semantic_bias_contribution": (
+                (self.ln_post_bias @ self.visual_projection @ semantic_weights).view(1, 1, -1)
+                / projection_norm
+            ),
+        }
+
     def forward(
         self,
         circuit: torch.Tensor,
@@ -192,12 +250,17 @@ class ChannelRankVerifier(nn.Module):
         times = torch.arange(circuit.shape[1], device=circuit.device).unsqueeze(0)
         mask = times < lengths.unsqueeze(1)
         atoms = self._channel_state(circuit, last_hidden, mask)
+        semantic = self._semantic_circuit(last_hidden)
         rank_scales = F.softplus(self.rank_scale_logits)
+        semantic_rank_scales = F.softplus(self.semantic_rank_scale_logits)
 
         # Explicit likelihood-ratio fusion. It changes only prediction order;
         # no baseline feature, encoder, temporal module, or classifier changes.
         log_probability = baseline_probability.clamp_min(1e-6).log()
-        hidden_factor = atoms["class_evidence"] * rank_scales.view(1, 1, -1)
+        hidden_factor = (
+            atoms["class_evidence"] * rank_scales.view(1, 1, -1)
+            + semantic["semantic_probability"] * semantic_rank_scales.view(1, 1, -1)
+        )
         fused_logits = torch.cat((log_probability[..., :1], log_probability[..., 1:] + hidden_factor), dim=-1)
         verified_all = F.softmax(fused_logits, dim=-1).masked_fill(~mask.unsqueeze(-1), 0.0)
         verified = 1.0 - verified_all[..., 0]
@@ -209,6 +272,7 @@ class ChannelRankVerifier(nn.Module):
             atoms["class_evidence"] * hidden_temperature.view(1, 1, -1)
             + self.hidden_bias.view(1, 1, -1)
         )
+        hidden_probability = torch.maximum(hidden_probability, semantic["semantic_probability"])
         hidden_anomaly = (1.0 - (1.0 - hidden_probability).prod(dim=-1)).masked_fill(~mask, 0.0)
         result = {
             "score": verified,
@@ -216,6 +280,7 @@ class ChannelRankVerifier(nn.Module):
             "baseline_probability": baseline_probability,
             "mask": mask,
             "rank_scales": rank_scales,
+            "semantic_rank_scales": semantic_rank_scales,
             "hidden_anomaly": hidden_anomaly,
             "hidden_probability": hidden_probability,
             # Aliases keep the evaluator contract stable.
@@ -224,6 +289,7 @@ class ChannelRankVerifier(nn.Module):
             "class_gains": rank_scales,
             "verification_strength": rank_scales.mean(),
             **atoms,
+            **semantic,
         }
         if return_channel_contribution:
             result["state_channel_contribution"] = (
@@ -236,6 +302,11 @@ class ChannelRankVerifier(nn.Module):
             )
             result["channel_contribution"] = (
                 result["state_channel_contribution"] + result["transition_channel_contribution"]
+            )
+            result["semantic_hidden_contribution"] = (
+                semantic["semantic_ln_hidden"].unsqueeze(-1)
+                * semantic["semantic_hidden_weight"].view(1, 1, 768, self.anomaly_class_count)
+                / semantic["semantic_projection_norm"].unsqueeze(-1)
             )
         return result
 
@@ -265,21 +336,37 @@ def verifier_loss(
     bag = F.binary_cross_entropy(pooled, class_targets)
     hidden_pooled = mil_topk_mean(outputs["hidden_probability"], lengths)
     hidden_bag = F.binary_cross_entropy(hidden_pooled, class_targets)
+    # Keep the all-channel text circuit independently predictive.  Without
+    # this term it can be ignored by a strong frozen baseline and never earn
+    # a meaningful, auditable contribution to frame ranking.
+    semantic_pooled = mil_topk_mean(outputs["semantic_probability"], lengths)
+    semantic_bag = F.binary_cross_entropy(semantic_pooled, class_targets)
     normal = class_targets.sum(dim=-1) < 0.5
     if bool(normal.any()):
         normal_score = outputs["score"][normal]
         normal_mask = outputs["mask"][normal]
         normal_loss = F.binary_cross_entropy(normal_score[normal_mask], torch.zeros_like(normal_score[normal_mask]))
+        semantic_normal = outputs["semantic_probability"][normal]
+        semantic_mask = outputs["mask"][normal].unsqueeze(-1).expand_as(semantic_normal)
+        semantic_normal_loss = F.binary_cross_entropy(
+            semantic_normal[semantic_mask], torch.zeros_like(semantic_normal[semantic_mask])
+        )
     else:
         normal_loss = torch.zeros((), device=class_targets.device)
+        semantic_normal_loss = torch.zeros((), device=class_targets.device)
     difference = (outputs["verified_all"] - outputs["baseline_probability"]).abs().mean(dim=-1)
     preserve = (difference * outputs["mask"].to(difference.dtype)).sum() / outputs["mask"].sum().clamp_min(1)
     sparse = 0.5 * (outputs["state_gates"].mean() + outputs["transition_gates"].mean())
-    semantic_anchor = outputs["state_correction"].square().mean()
+    semantic_anchor = (
+        outputs["state_correction"].square().mean()
+        + outputs["semantic_weights"].sub(4.0 * outputs["semantic_text_prior"]).square().mean()
+    )
     total = (
         bag
         + float(hidden_mil_weight) * hidden_bag
+        + float(hidden_mil_weight) * semantic_bag
         + float(normal_weight) * normal_loss
+        + float(normal_weight) * semantic_normal_loss
         + float(preserve_weight) * preserve
         + float(sparsity_weight) * sparse
         + float(semantic_anchor_weight) * semantic_anchor
@@ -287,7 +374,9 @@ def verifier_loss(
     return total, {
         "bag": float(bag.detach()),
         "hidden_bag": float(hidden_bag.detach()),
+        "semantic_bag": float(semantic_bag.detach()),
         "normal": float(normal_loss.detach()),
+        "semantic_normal": float(semantic_normal_loss.detach()),
         "preserve": float(preserve.detach()),
         "sparse": float(sparse.detach()),
         "semantic_anchor": float(semantic_anchor.detach()),

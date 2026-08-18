@@ -40,6 +40,9 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
     contribution = outputs["channel_contribution"].abs()
     count = min(int(topk), contribution.shape[-2])
     values, indices = contribution[0, :length].topk(count, dim=-2)
+    semantic_contribution = outputs["semantic_hidden_contribution"].abs()
+    semantic_count = min(int(topk), semantic_contribution.shape[-2])
+    semantic_values, semantic_indices = semantic_contribution[0, :length].topk(semantic_count, dim=-2)
     return {
         "hidden_anomaly": outputs["hidden_anomaly"][0, :length].cpu().numpy().astype(np.float32),
         "class_evidence": outputs["class_evidence"][0, :length].cpu().numpy().astype(np.float32),
@@ -62,9 +65,16 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
         "transition_scale": outputs["transition_scales"].cpu().numpy().astype(np.float32),
         "rank_scale": outputs["rank_scales"].cpu().numpy().astype(np.float32),
         "class_gain": outputs["class_gains"].cpu().numpy().astype(np.float32),
+        "semantic_rank_scale": outputs["semantic_rank_scales"].cpu().numpy().astype(np.float32),
+        "semantic_probability": outputs["semantic_probability"][0, :length].cpu().numpy().astype(np.float32),
+        "semantic_logit": outputs["semantic_logit"][0, :length].cpu().numpy().astype(np.float32),
+        "semantic_text_weight": outputs["semantic_weights"].cpu().numpy().astype(np.float32),
+        "semantic_projection_norm": outputs["semantic_projection_norm"][0, :length].cpu().numpy().astype(np.float32),
         "verification_strength": outputs["verification_strength"].reshape(1).cpu().numpy().astype(np.float32),
         "top_circuit_index_by_class": indices.cpu().numpy().astype(np.int64),
         "top_circuit_contribution_by_class": values.cpu().numpy().astype(np.float32),
+        "top_semantic_hidden_index_by_class": semantic_indices.cpu().numpy().astype(np.int64),
+        "top_semantic_hidden_contribution_by_class": semantic_values.cpu().numpy().astype(np.float32),
     }
 
 
