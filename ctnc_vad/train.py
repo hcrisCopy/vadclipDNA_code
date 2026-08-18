@@ -13,7 +13,7 @@ from tqdm import tqdm
 from .assets import load_assets
 from .baseline import build_frozen_baseline
 from .baseline_cache import prepare_score_cache
-from .circuit import ChannelRankVerifier, verifier_loss
+from .circuit import ChannelRankVerifier, load_verifier_state, verifier_loss
 from .common import (
     atomic_torch_save,
     default_output_root,
@@ -171,7 +171,7 @@ def main() -> None:
     semantic_parameters = [
         model.semantic_correction,
         model.semantic_bias,
-        model.semantic_rank_scale_logits,
+        model.semantic_binary_scale_logits,
     ]
     semantic_ids = {id(parameter) for parameter in semantic_parameters}
     circuit_parameters = [parameter for parameter in model.parameters() if id(parameter) not in semantic_ids]
@@ -188,7 +188,7 @@ def main() -> None:
         if not last_path.is_file():
             raise FileNotFoundError(f"--resume requested but {last_path} is absent")
         checkpoint = checkpoint_state(last_path)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        load_verifier_state(model, checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = int(checkpoint["epoch"]) + 1

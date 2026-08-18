@@ -10,7 +10,7 @@ import torch
 from tqdm import tqdm
 
 from .assets import load_assets
-from .circuit import ChannelRankVerifier
+from .circuit import ChannelRankVerifier, load_verifier_state
 from .common import atomic_save_npz, default_output_root, hidden_manifest_paths, stage_dir, write_csv
 from .dataset import HiddenBagDataset
 
@@ -67,7 +67,7 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
         "transition_scale": outputs["transition_scales"].cpu().numpy().astype(np.float32),
         "rank_scale": outputs["rank_scales"].cpu().numpy().astype(np.float32),
         "class_gain": outputs["class_gains"].cpu().numpy().astype(np.float32),
-        "semantic_rank_scale": outputs["semantic_rank_scales"].cpu().numpy().astype(np.float32),
+        "semantic_binary_scale": outputs["semantic_binary_scale"].cpu().numpy().astype(np.float32),
         "semantic_probability": outputs["semantic_probability"][0, :length].cpu().numpy().astype(np.float32),
         "semantic_logit": outputs["semantic_logit"][0, :length].cpu().numpy().astype(np.float32),
         "semantic_text_weight": outputs["semantic_weights"].cpu().numpy().astype(np.float32),
@@ -125,7 +125,7 @@ def main() -> None:
     )
     device = torch.device(args.device)
     model = ChannelRankVerifier(assets).to(device)
-    model.load_state_dict(model_state(args.model_path), strict=True)
+    load_verifier_state(model, model_state(args.model_path))
     rows: list[list[object]] = []
     for item in tqdm(dataset, desc=f"CTNC audit {args.split_name}", unit="video"):
         target = output / f"{item['key']}.npz"

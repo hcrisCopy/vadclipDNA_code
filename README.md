@@ -73,14 +73,13 @@ softmax 后的类别概率与异常分数（排序/定位）
 其中 state 是 hidden 相对**最近的真实正常原型**的有符号偏离，transition 是相对正常 context 的局部变化惊异度；两者都是逐帧、逐 `layer-dimension-text` 可分解的线性证据。原型检索避免把同一场景中的不同正常姿态、镜头或运动模式粗暴压成一个均值。读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
 
 ```text
-hidden_evidence(c) = sparse_rank_scale(c) × [state_scale(c) × state_evidence(c)
-                                             + transition_scale(c) × transition_novelty_evidence(c)]
-                   + semantic_rank_scale(c) × semantic_probability(c)
-log p_final(c) = log p_frozen(c)
-               + hidden_evidence(c)
+semantic_anomaly = 1 - product_c [1 - semantic_probability(c)]
+logit p_final(anomaly) = logit p_frozen(anomaly)
+                       + semantic_binary_scale × logit semantic_anomaly
+p_final(class c | anomaly) = p_frozen(class c | anomaly)
 ```
 
-随后对全部类别做 softmax。这样既能提高正确异常类别，也能压低与视频类别证据冲突的错误异常类别；最终 `1 - p_final(normal)` 用于帧级排序/定位，`p_final(all classes)` 用于 detection mAP。损失包含冻结后输出的 MIL、稀疏正常性电路的 direct MIL、全通道语义电路的 direct MIL、正常视频帧约束、很小的冻结输出保持项、双 gate 稀疏项和文本方向锚定项。全通道语义电路必须单独预测视频原始类别，不能只是跟随 baseline。
+这里稀疏正常性电路不再直接给异常帧加分：若它在正常帧上不可靠，只作为可解释的反事实审计而不污染排序。语义电路先判断“异常还是正常”，随后完整保留冻结 baseline 在异常类别之间的条件概率，因而适配任意输出 normal + anomaly classes 的 baseline。最终 `p_final(anomaly)` 用于帧级排序/定位，回填后的 `p_final(all classes)` 用于 detection mAP。损失包含冻结后输出的 MIL、稀疏正常性电路的 direct MIL、全通道语义电路的 direct MIL、正常视频帧约束、很小的冻结输出保持项、双 gate 稀疏项和文本方向锚定项。全通道语义电路必须单独预测视频原始类别，不能只是跟随 baseline。
 
 ## 数据与目录约束
 

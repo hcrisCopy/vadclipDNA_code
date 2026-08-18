@@ -9,7 +9,7 @@ import torch
 
 from .assets import load_assets
 from .baseline import build_frozen_baseline
-from .circuit import ChannelRankVerifier
+from .circuit import ChannelRankVerifier, load_verifier_state
 from .common import default_output_root, hidden_manifest_paths, save_json, stage_dir
 from .dataset import HiddenBagDataset
 from .evaluate import collect_predictions, summarize_predictions, write_prediction_index
@@ -65,7 +65,7 @@ def main() -> None:
         options.visual_length, False, args.alignment, False,
     )
     verifier = ChannelRankVerifier(assets).to(device)
-    verifier.load_state_dict(model_state(args.model_path), strict=True)
+    load_verifier_state(verifier, model_state(args.model_path))
     gt = np.load(args.gt_path)
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)

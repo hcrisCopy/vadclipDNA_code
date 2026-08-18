@@ -30,6 +30,25 @@ def inverse_softplus(value: float) -> float:
     return math.log(math.expm1(value))
 
 
+def load_verifier_state(model: "ChannelRankVerifier", state: dict[str, torch.Tensor]) -> None:
+    """Load a verifier checkpoint, including the one safe fusion migration.
+
+    The move from class-wise semantic addition to a binary semantic odds
+    scale changes only the final fusion parameter.  All frozen-path reader
+    weights remain compatible, so retaining them makes comparisons fair and
+    avoids retraining an already learned hidden/text circuit.
+    """
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    allowed_missing = {"semantic_binary_scale_logits"}
+    allowed_unexpected = {"semantic_rank_scale_logits"}
+    if set(missing) - allowed_missing or set(unexpected) - allowed_unexpected:
+        raise RuntimeError(
+            "incompatible CTNC verifier checkpoint; "
+            f"missing={sorted(set(missing) - allowed_missing)}, "
+            f"unexpected={sorted(set(unexpected) - allowed_unexpected)}"
+        )
+
+
 class ChannelRankVerifier(nn.Module):
     """Auditable state-and-transition likelihood circuit over frozen VadCLIP.
 
@@ -119,12 +138,11 @@ class ChannelRankVerifier(nn.Module):
         # learns one auditable correction vector per anomaly text.
         self.semantic_correction = nn.Parameter(torch.zeros(512, self.anomaly_class_count))
         self.semantic_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -2.0))
-        self.semantic_rank_scale_logits = nn.Parameter(
-            # Start the semantic reader at a visible but still conservative
-            # likelihood factor.  Its direct MIL loss determines whether it
-            # should increase or decrease from this prior.
-            torch.full((self.anomaly_class_count,), inverse_softplus(0.20))
-        )
+        # A single, positive semantic odds scale is deliberately shared by
+        # all anomaly classes. The frozen baseline retains responsibility for
+        # class allocation; the hidden circuit answers only the question that
+        # matters for localization: is this frame anomalous rather than normal?
+        self.semantic_binary_scale_logits = nn.Parameter(torch.tensor(inverse_softplus(0.10)))
 
     def _context_indices(self, last_hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         signature = F.normalize(masked_mean(last_hidden, mask), dim=-1, eps=1e-6)
@@ -252,18 +270,23 @@ class ChannelRankVerifier(nn.Module):
         atoms = self._channel_state(circuit, last_hidden, mask)
         semantic = self._semantic_circuit(last_hidden)
         rank_scales = F.softplus(self.rank_scale_logits)
-        semantic_rank_scales = F.softplus(self.semantic_rank_scale_logits)
+        semantic_binary_scale = F.softplus(self.semantic_binary_scale_logits)
 
-        # Explicit likelihood-ratio fusion. It changes only prediction order;
-        # no baseline feature, encoder, temporal module, or classifier changes.
-        log_probability = baseline_probability.clamp_min(1e-6).log()
-        hidden_factor = (
-            atoms["class_evidence"] * rank_scales.view(1, 1, -1)
-            + semantic["semantic_probability"] * semantic_rank_scales.view(1, 1, -1)
-        )
-        fused_logits = torch.cat((log_probability[..., :1], log_probability[..., 1:] + hidden_factor), dim=-1)
-        verified_all = F.softmax(fused_logits, dim=-1).masked_fill(~mask.unsqueeze(-1), 0.0)
-        verified = 1.0 - verified_all[..., 0]
+        # Do not let a weak sparse normality atom globally promote anomalous
+        # frames.  Instead, fuse the reliable, all-channel semantic evidence
+        # at the *binary normal/anomaly odds* level, then preserve the frozen
+        # baseline's conditional anomaly-class distribution.  This changes
+        # localization/ranking while leaving every baseline weight untouched.
+        baseline_anomaly = (1.0 - baseline_probability[..., 0]).clamp(1e-6, 1.0 - 1e-6)
+        semantic_anomaly_unmasked = 1.0 - (1.0 - semantic["semantic_probability"]).prod(dim=-1)
+        semantic_anomaly_clamped = semantic_anomaly_unmasked.clamp(1e-6, 1.0 - 1e-6)
+        baseline_log_odds = torch.logit(baseline_anomaly)
+        semantic_log_odds = torch.logit(semantic_anomaly_clamped)
+        verified = torch.sigmoid(baseline_log_odds + semantic_binary_scale * semantic_log_odds).masked_fill(~mask, 0.0)
+        conditional_class = baseline_probability[..., 1:] / baseline_anomaly.unsqueeze(-1)
+        verified_all = torch.cat(
+            ((1.0 - verified).unsqueeze(-1), verified.unsqueeze(-1) * conditional_class), dim=-1
+        ).masked_fill(~mask.unsqueeze(-1), 0.0)
 
         # The direct hidden probe is the same declared evidence under a
         # class-wise logistic calibration, not an independent black-box head.
@@ -272,7 +295,7 @@ class ChannelRankVerifier(nn.Module):
             atoms["class_evidence"] * hidden_temperature.view(1, 1, -1)
             + self.hidden_bias.view(1, 1, -1)
         )
-        semantic_anomaly = 1.0 - (1.0 - semantic["semantic_probability"]).prod(dim=-1)
+        semantic_anomaly = semantic_anomaly_unmasked
         sparse_hidden_anomaly = (
             1.0 - (1.0 - sparse_hidden_probability).prod(dim=-1)
         ).masked_fill(~mask, 0.0)
@@ -284,7 +307,7 @@ class ChannelRankVerifier(nn.Module):
             "baseline_probability": baseline_probability,
             "mask": mask,
             "rank_scales": rank_scales,
-            "semantic_rank_scales": semantic_rank_scales,
+            "semantic_binary_scale": semantic_binary_scale.reshape(1),
             "hidden_anomaly": hidden_anomaly,
             "hidden_probability": hidden_probability,
             "sparse_hidden_probability": sparse_hidden_probability,
@@ -294,7 +317,7 @@ class ChannelRankVerifier(nn.Module):
             "gates": atoms["state_gates"].mean(dim=1),
             "class_gates": atoms["state_gates"],
             "class_gains": rank_scales,
-            "verification_strength": rank_scales.mean(),
+            "verification_strength": semantic_binary_scale,
             **atoms,
             **semantic,
         }
