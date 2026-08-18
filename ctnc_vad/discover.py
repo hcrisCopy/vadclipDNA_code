@@ -108,7 +108,11 @@ def main() -> None:
     parser.add_argument("--std-floor", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=234)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--allow-missing-hidden", action="store_true", help="Skip source videos absent from the hidden manifest and record them.")
+    parser.add_argument(
+        "--strict-hidden-manifest",
+        action="store_true",
+        help="Fail instead of intersecting the source CSV with the hidden manifest. By default, missing training hidden states are skipped and recorded.",
+    )
     parser.add_argument("--clean", action="store_true", help="Delete and rebuild only discovery/ under --output-root.")
     parser.add_argument("--no-resume", action="store_true", help="Recompute discovery even when discovery/circuit_assets.pt exists.")
     args = parser.parse_args()
@@ -138,10 +142,10 @@ def main() -> None:
     for key, group in groups.items():
         path = hidden_by_key.get(key)
         if path is None:
-            if args.allow_missing_hidden:
-                missing.append((key, str(group.iloc[0]["label"])))
-                continue
-            raise FileNotFoundError(f"{key}: absent from {args.hidden_manifest}")
+            if args.strict_hidden_manifest:
+                raise FileNotFoundError(f"{key}: absent from {args.hidden_manifest}")
+            missing.append((key, str(group.iloc[0]["label"])))
+            continue
         rows.append((key, str(group.iloc[0]["label"]), path))
     normal_rows = [row for row in rows if is_normal_video(args.dataset, row[1])]
     abnormal_rows = [row for row in rows if not is_normal_video(args.dataset, row[1])]
@@ -290,6 +294,12 @@ def main() -> None:
         table_rows,
     )
     write_csv(output / "missing_hidden.csv", ["video_key", "label"], missing)
+    if missing:
+        print(
+            f"warning: skipped {len(missing)} source videos without cached hidden states; "
+            f"see {output / 'missing_hidden.csv'}",
+            flush=True,
+        )
     save_json(output / "summary.json", {
         "dataset": args.dataset,
         "source_train_csv": args.source_train_csv,

@@ -71,7 +71,11 @@ def main() -> None:
     parser.add_argument("--rank-steps", type=int, default=3)
     parser.add_argument("--seed", type=int, default=234)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--allow-missing-train-hidden", action="store_true")
+    parser.add_argument(
+        "--strict-train-hidden-manifest",
+        action="store_true",
+        help="Fail when a training video is absent from the train hidden manifest. The default is to skip and record only those training videos.",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume exactly from training/checkpoint_last.pth.")
     parser.add_argument("--clean", action="store_true", help="Delete and rebuild only training/ under --output-root.")
     args = parser.parse_args()
@@ -110,12 +114,19 @@ def main() -> None:
     baseline, options = build_frozen_baseline(args.dataset, args.init_baseline_model, device)
     train_set = HiddenBagDataset(
         args.dataset, args.source_train_csv, args.source_path_base, train_hidden, selected_layers, selected_dimensions,
-        options.visual_length, True, args.alignment, args.allow_missing_train_hidden,
+        options.visual_length, True, args.alignment, not args.strict_train_hidden_manifest,
     )
     test_set = HiddenBagDataset(
         args.dataset, args.source_test_csv, args.source_path_base, test_hidden, selected_layers, selected_dimensions,
         options.visual_length, False, args.alignment, False,
     )
+    write_csv(output / "missing_train_hidden.csv", ["video_key"], [[key] for key in train_set.skipped])
+    if train_set.skipped:
+        print(
+            f"warning: skipped {len(train_set.skipped)} training videos without cached hidden states; "
+            f"see {output / 'missing_train_hidden.csv'}",
+            flush=True,
+        )
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda"
     )

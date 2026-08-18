@@ -8,7 +8,7 @@ CTNC-VAD 不训练或修改 VadCLIP，也不使用 DNA 的 `top-k baseline score
 
 - source CSV 必须有 `path,label` 两列，`path` 指向原始 512D VadCLIP 特征。XD 训练 CSV 中同键的 `__0` … `__9` 是同一视频的 VadCLIP 训练增强；CTNC 将它们聚成一条 hidden trajectory，并仅以排序后的第一条 feature 做时间长度对齐，不会把十条增强错误拼接成长视频。
 - hidden manifest 必须有 `key,hidden_path` 两列；hidden 文件是已有的 `hidden=[T,12,768]` CLS artifact。
-- source feature 的视频键和 manifest 的 `key` 按文件名去掉末尾 `__数字` 对齐。XD 同时接受 `A` 和官方分块列表中的 `A-0-0` normal 标签。
+- source feature 的视频键和 manifest 的 `key` 按文件名去掉末尾 `__数字` 对齐。XD 同时接受 `A` 和官方分块列表中的 `A-0-0` normal 标签。发现和训练阶段默认取二者交集，缺失的训练 hidden 会写入 `discovery/missing_hidden.csv` 或 `training/missing_train_hidden.csv`；测试阶段保持严格，以免评测样本不完整。需要把缺失视为错误时，分别加 `--strict-hidden-manifest`、`--strict-train-hidden-manifest`。
 - 正式实验前应确认 feature 与 hidden 的时间长度一致；现有产物若存在已知截断，可使用下方默认的 `--alignment crop_hidden`。
 
 ## XD-Violence
