@@ -109,7 +109,10 @@ class ChannelRankVerifier(nn.Module):
         self.channel_temperature_logits = nn.Parameter(
             torch.full((self.anomaly_class_count,), inverse_softplus(2.0))
         )
-        self.channel_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -2.0))
+        # Six independent anomaly texts are unioned below. A conservative
+        # individual prior prevents that union from promoting ordinary frames
+        # before weak MIL has identified reliable channel witnesses.
+        self.channel_bias = nn.Parameter(torch.full((self.anomaly_class_count,), -4.0))
         initial_fusion_scale = max(0.01, float(torch.sigmoid(torch.tensor(verification_initial_logit))))
         self.fusion_scale_logits = nn.Parameter(torch.tensor(inverse_softplus(initial_fusion_scale)))
 
