@@ -56,6 +56,20 @@ def percentile_tail_mean(values: np.ndarray, fraction: float) -> np.ndarray:
     return tail.mean(axis=0)
 
 
+def normal_subspace_residual(states: np.ndarray, basis: np.ndarray) -> np.ndarray:
+    """Remove a fixed normal subspace while keeping original coordinates.
+
+    ``states`` has shape ``[frames, layers, dimensions]`` and ``basis`` is
+    ``[layers, dimensions, rank]``.  The result has the *same* coordinates as
+    the input.  This is important: PCA/SVD is used only to define what normal
+    co-variation can be ignored; a selected witness is still one concrete
+    CLIP ``layer--dimension`` rather than a principal-component index.
+    """
+    coefficients = np.einsum("tld,ldr->tlr", states, basis, optimize=True)
+    reconstruction = np.einsum("tlr,ldr->tld", coefficients, basis, optimize=True)
+    return states - reconstruction
+
+
 def rank_within_layer(values: np.ndarray) -> np.ndarray:
     rank = np.empty_like(values, dtype=np.float32)
     for layer in range(values.shape[0]):
@@ -179,6 +193,18 @@ def main() -> None:
         "--subspace-rank", type=int, default=16,
         help="Rank of each normal SVD subspace; residuals remain original selected hidden channels.",
     )
+    parser.add_argument(
+        "--global-subspace-rank", type=int, default=16,
+        help="Rank of the all-channel normal SVD used only to select original hidden witnesses.",
+    )
+    parser.add_argument(
+        "--global-subspace-frames", type=int, default=4,
+        help="Uniform normal frames per video for randomized all-channel SVD discovery.",
+    )
+    parser.add_argument(
+        "--frame-topk", type=int, default=8,
+        help="Per-text number of strongest original channel witnesses retained at each frame.",
+    )
     parser.add_argument("--frames-per-video", type=int, default=128, help="Maximum cached frames per video used for semantic-lens fitting.")
     parser.add_argument("--tail-fraction", type=float, default=0.125, help="Bag-level upper-tail fraction; never uses a baseline score.")
     parser.add_argument("--semantic-weight", type=float, default=0.5, help="Weight of frozen text-lens evidence in channel selection.")
@@ -199,6 +225,7 @@ def main() -> None:
     if min(
         args.candidate_per_layer, args.context_count, args.frames_per_video, args.context_iters,
         args.normal_prototype_count, args.prototype_frames_per_video, args.subspace_rank,
+        args.global_subspace_rank, args.global_subspace_frames, args.frame_topk,
     ) <= 0:
         parser.error("candidate/context/prototype/frame counts and context iterations must be positive")
     if args.std_floor <= 0 or args.ridge < 0:
@@ -213,7 +240,7 @@ def main() -> None:
     asset_path = output / "circuit_assets.pt"
     if asset_path.is_file() and not args.no_resume:
         old = torch.load(asset_path, map_location="cpu", weights_only=False)
-        if isinstance(old, dict) and int(old.get("version", -1)) == 6:
+        if isinstance(old, dict) and int(old.get("version", -1)) == 7:
             print(f"reuse {asset_path}; pass --no-resume or --clean to rebuild discovery", flush=True)
             return
         print(f"rebuild {asset_path}: old discovery version is incompatible with channel witnesses", flush=True)
@@ -242,6 +269,8 @@ def main() -> None:
     layers, width = int(first.shape[1]), int(first.shape[2])
     if width != 768 or args.candidate_per_layer > width:
         raise ValueError(f"candidate-per-layer must be <= hidden width 768, got {args.candidate_per_layer}")
+    if args.global_subspace_rank >= width:
+        raise ValueError("--global-subspace-rank must be smaller than the CLIP hidden width")
 
     # Pass 1: pure-normal global moments and video signatures.  No anomaly score is involved.
     state_sum = np.zeros((layers, width), dtype=np.float64)
@@ -260,6 +289,42 @@ def main() -> None:
         normal_keys.append(key)
     global_mean = state_sum / max(1, state_count)
     global_std = np.sqrt(np.maximum(state_square_sum / max(1, state_count) - np.square(global_mean), args.std_floor ** 2))
+
+    # A compact randomized SVD finds the shared *all-channel* normal
+    # subspace.  It is deliberately a discovery-only operation: its role is
+    # to select dimensions whose weak abnormal evidence survives removal of
+    # ordinary correlated changes (camera, pose, background), not to replace
+    # original dimensions with opaque PCA components at inference.
+    global_sketch_width = min(width, args.global_subspace_rank + 8)
+    global_rng = np.random.default_rng(args.seed)
+    random_probe = global_rng.standard_normal((width, global_sketch_width)).astype(np.float32)
+    range_sketch = np.zeros((layers, width, global_sketch_width), dtype=np.float64)
+    for _key, _label, path in tqdm(normal_rows, desc="fit normal SVD range", unit="video"):
+        hidden = load_hidden(path)
+        sampled = hidden[uniform_indices(len(hidden), args.global_subspace_frames)]
+        standardized = ((sampled - global_mean[None]) / global_std[None]).astype(np.float32)
+        for layer in range(layers):
+            projected = standardized[:, layer] @ random_probe
+            range_sketch[layer] += standardized[:, layer].T @ projected
+    range_basis = np.empty((layers, width, global_sketch_width), dtype=np.float64)
+    for layer in range(layers):
+        range_basis[layer] = np.linalg.qr(range_sketch[layer], mode="reduced")[0]
+
+    small_covariance = np.zeros((layers, global_sketch_width, global_sketch_width), dtype=np.float64)
+    for _key, _label, path in tqdm(normal_rows, desc="fit normal SVD spectrum", unit="video"):
+        hidden = load_hidden(path)
+        sampled = hidden[uniform_indices(len(hidden), args.global_subspace_frames)]
+        standardized = ((sampled - global_mean[None]) / global_std[None]).astype(np.float32)
+        for layer in range(layers):
+            projected = standardized[:, layer] @ range_basis[layer]
+            small_covariance[layer] += projected.T @ projected
+    global_normal_subspace_basis = np.empty((layers, width, args.global_subspace_rank), dtype=np.float32)
+    for layer in range(layers):
+        _values, vectors = np.linalg.eigh(small_covariance[layer])
+        global_normal_subspace_basis[layer] = (
+            range_basis[layer] @ vectors[:, -args.global_subspace_rank:]
+        ).astype(np.float32)
+
     context_centers, context_assignments = kmeans_unit_vectors(
         np.stack(signatures), args.context_count, args.context_iters, args.seed
     )
@@ -297,7 +362,9 @@ def main() -> None:
     semantic_text_score = np.abs(semantic_response).astype(np.float32)
     semantic_score = semantic_text_score.max(axis=-1)
 
-    # Pass 3: weak bag statistics.  The tail is over a hidden coordinate, not a baseline prediction.
+    # Pass 3: weak bag statistics after projecting out the all-channel normal
+    # subspace. The tail is still an original hidden coordinate, never a
+    # baseline prediction or a principal-component feature.
     normal_tail_sum = np.zeros((layers, width), dtype=np.float64)
     class_tail_sum = np.zeros((anomaly_text_count, layers, width), dtype=np.float64)
     normal_bags = 0
@@ -306,7 +373,9 @@ def main() -> None:
         hidden = load_hidden(path)
         if hidden.shape[1:] != (layers, width):
             raise ValueError(f"{key}: hidden shape {hidden.shape} differs from [{layers},{width}]")
-        tail = percentile_tail_mean(np.abs((hidden - global_mean) / global_std), args.tail_fraction)
+        standardized = (hidden - global_mean[None]) / global_std[None]
+        normal_complement = normal_subspace_residual(standardized, global_normal_subspace_basis)
+        tail = percentile_tail_mean(np.abs(normal_complement), args.tail_fraction)
         if is_normal_video(args.dataset, label):
             normal_tail_sum += tail
             normal_bags += 1
@@ -331,7 +400,11 @@ def main() -> None:
     selected_dimensions = chosen_dims.reshape(-1).astype(np.int64)
     selected_width = len(selected_layers)
     selected_affinity = semantic_response[selected_layers, selected_dimensions]
-    selected_text_class = np.abs(selected_affinity).argmax(axis=-1).astype(np.int64) + 1
+    # The discovery selector has already assigned a witness to one anomaly
+    # text. Keep its signed CLIP response for that same text; choosing a
+    # different dominant text here would make a channel's explanation and
+    # its learned class gate disagree.
+    selected_text_class = selection_text_classes.reshape(-1).astype(np.int64) + 1
     selected_text_direction = np.sign(
         selected_affinity[np.arange(selected_width), selected_text_class - 1]
     ).astype(np.float32)
@@ -408,7 +481,7 @@ def main() -> None:
             normal_subspace_basis[context, layer] = vectors[:, -args.subspace_rank:].astype(np.float32)
 
     artifact = {
-        "version": 6,
+        "version": 7,
         "dataset": args.dataset,
         "hidden_layers": layers,
         "hidden_width": width,
@@ -429,6 +502,9 @@ def main() -> None:
         "normal_prototypes": torch.from_numpy(normal_prototypes),
         "normal_subspace_basis": torch.from_numpy(normal_subspace_basis),
         "subspace_rank": args.subspace_rank,
+        "global_normal_subspace_basis": torch.from_numpy(global_normal_subspace_basis),
+        "global_subspace_rank": args.global_subspace_rank,
+        "frame_topk": args.frame_topk,
         "ln_post_weight": torch.from_numpy(ln_weight),
         "ln_post_bias": torch.from_numpy(ln_bias),
         "ln_post_eps": ln_eps,
@@ -450,7 +526,7 @@ def main() -> None:
     write_csv(
         output / "channel_scores.csv",
         [
-            "layer_1based", "dimension", "bag_discriminative", "semantic_lens", "combined",
+            "layer_1based", "dimension", "normal_complement_tail_discriminative", "semantic_lens", "combined",
             "dominant_anomaly_text", "signed_text_direction", "selected",
         ],
         table_rows,
@@ -469,7 +545,7 @@ def main() -> None:
                 ])
     write_csv(
         output / "channel_text_scores.csv",
-        ["layer_1based", "dimension", "anomaly_text", "class_tail_discriminative", "signed_semantic_lens", "combined"],
+        ["layer_1based", "dimension", "anomaly_text", "normal_complement_tail_discriminative", "signed_semantic_lens", "combined"],
         class_table_rows,
     )
     write_csv(output / "missing_hidden.csv", ["video_key", "label"], missing)
@@ -495,7 +571,10 @@ def main() -> None:
         "normal_prototype_count": args.normal_prototype_count,
         "prototype_frames_per_video": args.prototype_frames_per_video,
         "subspace_rank": args.subspace_rank,
-        "selection": "weak bag tail contrast plus signed frozen hidden-to-text semantic directions; no VadCLIP score is used",
+        "global_subspace_rank": args.global_subspace_rank,
+        "global_subspace_frames": args.global_subspace_frames,
+        "frame_topk": args.frame_topk,
+        "selection": "normal-complement weak bag tail contrast plus signed frozen hidden-to-text semantic directions; no VadCLIP score is used",
         "assets": relpath(asset_path, output),
     })
     print(

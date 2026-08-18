@@ -43,15 +43,19 @@ class ChannelRankVerifier(nn.Module):
     """A direct, class-assigned witness circuit over selected CLIP channels.
 
     For selected channel ``k`` and its assigned anomaly text ``c``, the
-    reader measures three non-negative, human-readable quantities:
+    reader measures four non-negative, human-readable quantities:
 
     ``state_excess(t,k) = relu(|h(t,k)-nearest_normal(k)|-threshold_state(k))``
     ``motion_excess(t,k) = relu(|delta_h(t,k)-normal_delta(k)|-threshold_motion(k))``.
     ``subspace_excess(t,k) = relu(|h(t,k)-projection_normal_subspace(k)|-threshold_subspace(k))``.
+    ``semantic_excess(t,k) = relu(direction(k) * prototype_residual(k) * subspace_deviation(k)-threshold_semantic(k))``.
 
-    Learned gates only choose which *preselected* witnesses remain useful for
-    that same text. There is no MLP, no learned visual embedding and no
-    all-hidden fallback path.
+    The last term is positive only when an original channel deviates from a
+    normal state *in the frozen CLIP text direction assigned to that channel*
+    and the deviation also escapes the normal subspace.  At each frame only
+    the strongest fixed number of these original channel witnesses per text
+    is retained. There is no MLP, learned visual embedding or all-hidden
+    fallback path.
     """
 
     def __init__(
@@ -77,6 +81,7 @@ class ChannelRankVerifier(nn.Module):
         self.register_buffer("normal_prototypes", assets["normal_prototypes"].float())
         self.register_buffer("normal_subspace_basis", assets["normal_subspace_basis"].float())
         self.subspace_rank = int(assets["subspace_rank"])
+        self.frame_topk = int(assets["frame_topk"])
         if self.width % self.layers != 0:
             raise ValueError("selected witnesses must have the same count in every hidden layer")
         self.channels_per_layer = self.width // self.layers
@@ -105,9 +110,11 @@ class ChannelRankVerifier(nn.Module):
         self.state_gate_logits = nn.Parameter(initial_gate)
         self.motion_gate_logits = nn.Parameter(initial_gate.clone())
         self.subspace_gate_logits = nn.Parameter(initial_gate.clone())
+        self.semantic_gate_logits = nn.Parameter(initial_gate.clone())
         self.state_threshold_logits = nn.Parameter(torch.full((self.width,), inverse_softplus(0.25)))
         self.motion_threshold_logits = nn.Parameter(torch.full((self.width,), inverse_softplus(0.20)))
         self.subspace_threshold_logits = nn.Parameter(torch.full((self.width,), inverse_softplus(0.20)))
+        self.semantic_threshold_logits = nn.Parameter(torch.full((self.width,), inverse_softplus(0.05)))
         self.state_scale_logits = nn.Parameter(
             torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
         )
@@ -116,6 +123,9 @@ class ChannelRankVerifier(nn.Module):
         )
         self.subspace_scale_logits = nn.Parameter(
             torch.full((self.anomaly_class_count,), inverse_softplus(1.0))
+        )
+        self.semantic_scale_logits = nn.Parameter(
+            torch.full((self.anomaly_class_count,), inverse_softplus(0.5))
         )
         self.channel_temperature_logits = nn.Parameter(
             torch.full((self.anomaly_class_count,), inverse_softplus(2.0))
@@ -164,6 +174,16 @@ class ChannelRankVerifier(nn.Module):
             prototypes, 1, nearest_index.unsqueeze(-1).expand(-1, -1, self.width)
         )
         prototype_residual = normalized_state - nearest_prototype
+        # ``selected_text_direction`` is fixed at discovery from CLIP's
+        # hidden-to-text route. Multiplying it with a prototype residual makes
+        # the sign meaningful: a positive value moves this exact original
+        # channel toward its assigned anomaly text. The normal-subspace term
+        # suppresses deviations that are common normal co-variation.
+        signed_text_residual = (
+            self.selected_text_direction.view(1, 1, -1)
+            * prototype_residual
+            * torch.tanh(subspace_residual.abs() / 3.0)
+        )
 
         delta = torch.cat((torch.zeros_like(circuit[:, :1]), circuit[:, 1:] - circuit[:, :-1]), dim=1)
         normalized_transition = torch.tanh(
@@ -180,6 +200,7 @@ class ChannelRankVerifier(nn.Module):
             "state_deviation": prototype_residual.abs(),
             "subspace_residual": subspace_residual,
             "subspace_deviation": torch.tanh(subspace_residual.abs() / 3.0),
+            "signed_text_residual": signed_text_residual,
             "normalized_transition": normalized_transition,
             "motion_deviation": motion_deviation,
         }
@@ -188,44 +209,65 @@ class ChannelRankVerifier(nn.Module):
         state_threshold = F.softplus(self.state_threshold_logits)
         motion_threshold = F.softplus(self.motion_threshold_logits)
         subspace_threshold = F.softplus(self.subspace_threshold_logits)
+        semantic_threshold = F.softplus(self.semantic_threshold_logits)
         state_excess = F.relu(deviations["state_deviation"] - state_threshold.view(1, 1, -1))
         motion_excess = F.relu(deviations["motion_deviation"] - motion_threshold.view(1, 1, -1))
         subspace_excess = F.relu(deviations["subspace_deviation"] - subspace_threshold.view(1, 1, -1))
+        semantic_excess = F.relu(deviations["signed_text_residual"] - semantic_threshold.view(1, 1, -1))
 
         state_gates = torch.sigmoid(self.state_gate_logits) * self.channel_class_mask
         motion_gates = torch.sigmoid(self.motion_gate_logits) * self.channel_class_mask
         subspace_gates = torch.sigmoid(self.subspace_gate_logits) * self.channel_class_mask
+        semantic_gates = torch.sigmoid(self.semantic_gate_logits) * self.channel_class_mask
         state_weights = state_gates / state_gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
         motion_weights = motion_gates / motion_gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
         subspace_weights = subspace_gates / subspace_gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
         state_evidence = torch.einsum("btk,kc->btc", state_excess, state_weights)
         motion_evidence = torch.einsum("btk,kc->btc", motion_excess, motion_weights)
         subspace_evidence = torch.einsum("btk,kc->btc", subspace_excess, subspace_weights)
+        # This is a dynamic sparse selection, not a learned projection: each
+        # value remains one selected layer--dimension witness. Top-k avoids
+        # diluting a localized semantic event by averaging every text's 128
+        # candidate channels.
+        semantic_contribution = semantic_excess.unsqueeze(-1) * semantic_gates.view(1, 1, self.width, -1)
+        semantic_topk_values, semantic_topk_indices = semantic_contribution.topk(
+            self.frame_topk, dim=-2
+        )
+        semantic_evidence = semantic_topk_values.mean(dim=-2)
         class_evidence = (
             state_evidence * F.softplus(self.state_scale_logits).view(1, 1, -1)
             + motion_evidence * F.softplus(self.motion_scale_logits).view(1, 1, -1)
             + subspace_evidence * F.softplus(self.subspace_scale_logits).view(1, 1, -1)
+            + semantic_evidence * F.softplus(self.semantic_scale_logits).view(1, 1, -1)
         )
         return {
             "state_threshold": state_threshold,
             "motion_threshold": motion_threshold,
             "subspace_threshold": subspace_threshold,
+            "semantic_threshold": semantic_threshold,
             "state_excess": state_excess,
             "motion_excess": motion_excess,
             "subspace_excess": subspace_excess,
+            "semantic_excess": semantic_excess,
             "state_gates": state_gates,
             "motion_gates": motion_gates,
             "subspace_gates": subspace_gates,
+            "semantic_gates": semantic_gates,
             "state_weights": state_weights,
             "motion_weights": motion_weights,
             "subspace_weights": subspace_weights,
             "state_evidence": state_evidence,
             "motion_evidence": motion_evidence,
             "subspace_evidence": subspace_evidence,
+            "semantic_evidence": semantic_evidence,
+            "semantic_contribution": semantic_contribution,
+            "semantic_topk_indices": semantic_topk_indices,
+            "semantic_topk_values": semantic_topk_values,
             "class_evidence": class_evidence,
             "state_scales": F.softplus(self.state_scale_logits),
             "motion_scales": F.softplus(self.motion_scale_logits),
             "subspace_scales": F.softplus(self.subspace_scale_logits),
+            "semantic_scales": F.softplus(self.semantic_scale_logits),
         }
 
     def forward(
@@ -288,10 +330,12 @@ class ChannelRankVerifier(nn.Module):
             result["subspace_channel_contribution"] = (
                 atoms["subspace_excess"].unsqueeze(-1) * atoms["subspace_weights"].view(1, 1, self.width, -1)
             )
+            result["semantic_channel_contribution"] = atoms["semantic_contribution"]
             result["channel_contribution"] = (
                 result["state_channel_contribution"]
                 + result["motion_channel_contribution"]
                 + result["subspace_channel_contribution"]
+                + result["semantic_channel_contribution"]
             )
         return result
 
@@ -335,7 +379,8 @@ def verifier_loss(
         outputs["state_gates"].mean()
         + outputs["motion_gates"].mean()
         + outputs["subspace_gates"].mean()
-    ) / 3.0
+        + outputs["semantic_gates"].mean()
+    ) / 4.0
     total = (
         bag
         + float(hidden_mil_weight) * witness_bag

@@ -12,31 +12,37 @@ CTNC-VAD 的唯一核心是：**从 CLIP 多层 hidden states 中选出少量有
          |                         只保留硬选择的 12 × 64 个通道
          |                         每个通道都有 layer / dim / 关联异常文本
          |                                      |
-         └────────── binary-odds 融合 ← 该通道偏离正常 state / motion / SVD 子空间的证据
+         └────────── binary-odds 融合 ← 少数通道在文本方向上逃离正常子空间的证据
                                       |
                             更好的帧排序与异常片段定位
 ```
 
 ## CTNC 到底在解释什么
 
-`discover` 先为每个候选 hidden 维度计算两件事：
+`discover` 先用纯正常视频的随机化 SVD 得到所有 768 个维度的“正常共同变化子空间”。然后在这个子空间的补空间中，为每个候选 hidden 维度计算两件事：
 
 1. 它在异常视频的高响应尾部是否显著不同于正常视频；
 2. 经冻结 CLIP 的 `hidden → visual → text` 路径，它与哪一个异常文本最相关、方向是什么。
 
 每层为各异常文本均衡地**硬选 64 个维度**。因此 XD 上只使用 `12 × 64 = 768` 个维度，而不是把全部 `12 × 768` hidden 扔进黑箱网络。
 
-对于测试帧，选中维度 `k` 只产生三种证据：
+对于测试帧，选中维度 `k` 产生四种证据：
 
 ```text
 state excess  = max(0, |当前通道 - 最近正常原型通道| - 学到的正常阈值)
 motion excess = max(0, |当前通道变化 - 正常变化| - 学到的正常阈值)
 subspace excess = max(0, |当前通道 - 正常 SVD 子空间重建通道| - 学到的正常阈值)
+semantic excess = max(0, 文本方向 × 最近正常原型残差 × 子空间残差强度 - 学到的阈值)
 ```
 
-SVD 只由纯正常视频的**已选通道**构建：每个 normal context、每一层都保留 rank-16 的正常变化子空间。它不输出 PCA 主成分做分类；输出仍然是原始 hidden 维度的残差。因此 SVD 用来消除正常通道的共同变化，而不牺牲“哪个 layer-dimension 异常”的解释。
+这里有两层 SVD，且都不把主成分拿来做分类：
 
-每个维度只服务于它在 discovery 时被分配的异常文本；训练仅学习该维度是否保留、三个阈值、文本内的加权和及一个融合尺度。没有 MLP、没有新视觉 embedding、没有 all-hidden 兜底路径。
+- 全通道 rank-16 normal SVD：只在 discovery 中淘汰普通的共同变化，帮助选择更有区分力的原始维度；
+- 每个场景、每层、已选通道的 rank-16 SVD：测试时抑制局部正常共变。
+
+两者的输出始终是原始 hidden 维度的残差。因此 SVD 只是正常参考，不会牺牲“哪个 layer-dimension 异常”的解释。`semantic excess` 还要求该残差移动到冻结 CLIP 隐层到文本路径所确定的异常文本方向。每帧、每个异常文本只保留 top-8 个这种原始通道 witness，避免把定位信号平均稀释。
+
+每个维度只服务于它在 discovery 时被分配的异常文本；训练仅学习该维度是否保留、四个阈值、文本内的加权和及一个融合尺度。没有 MLP、没有新视觉 embedding、没有 all-hidden 兜底路径。
 
 所以任意一次分数上升都可追溯为：
 
@@ -97,6 +103,9 @@ python -m ctnc_vad.discover \
   --normal-prototype-count 64 \
   --prototype-frames-per-video 32 \
   --subspace-rank 16 \
+  --global-subspace-rank 16 \
+  --global-subspace-frames 4 \
+  --frame-topk 8 \
   --frames-per-video 128 \
   --tail-fraction 0.125 \
   --semantic-weight 0.5 \
@@ -184,4 +193,4 @@ python -m ctnc_vad.audit \
   --clean
 ```
 
-每个 `audit/xd_test/*.npz` 都包含 `top_circuit_index_by_class` 和 `top_circuit_contribution_by_class`，再通过同文件的 `selected_layers`、`selected_dimensions`、`selected_text_class` 可恢复具体通道。`state_excess`、`motion_excess`、`subspace_excess`、阈值、gate 和 normal prototype index 说明该通道为什么在该帧贡献高；`subspace_residual` 始终与原始选中通道一一对应，而不是 PCA 主成分编号。
+每个 `audit/xd_test/*.npz` 都包含 `top_circuit_index_by_class`、`top_circuit_contribution_by_class`，以及文本一致的 `semantic_topk_circuit_index_by_class`。再通过同文件的 `selected_layers`、`selected_dimensions`、`selected_text_class` 可恢复具体通道。`state_excess`、`motion_excess`、`subspace_excess`、`signed_text_residual`、`semantic_excess`、阈值、gate 和 normal prototype index 说明该通道为什么在该帧贡献高；`subspace_residual` 始终与原始选中通道一一对应，而不是 PCA 主成分编号。
