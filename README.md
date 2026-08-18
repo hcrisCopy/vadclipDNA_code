@@ -46,6 +46,8 @@ softmax 后的类别概率与异常分数（排序/定位）
 
 全通道语义电路则复用 CLIP 原始的 `LayerNorm → visual projection → text direction` 路径。它不训练视觉编码器；每个异常文本只学习相对冻结文本方向的小校正，并将任一帧的 semantic logit 分摊回 768 个 final hidden 通道（包含 projection 归一化）。因此既能解释“哪个稀疏通道偏离正常原型”，也能解释“哪些 CLIP 内部维度正在支持 shooting / explosion 这个文本概念”。
 
+此外，CTNC 保存每条真实正常视频的 final CLIP visual prototype。测试视频先按全局 hidden signature 检索最相似的 8 条正常视频，再为每帧检索其中最相近的真实正常帧。这个 **normal-video counterfactual memory** 输出“距离、匹配正常视频编号、匹配正常帧编号”，能解释某帧为何不符合本场景的正常状态；它不是把 baseline 高分帧当作伪正常样本。
+
 ## 两个阶段
 
 ### 1. `discover`：只做一次、与 baseline 分数无关
@@ -69,6 +71,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 - 一个受冻结 CLIP 文本方向约束的、显式可导出的 state 校正量；
 - 每个异常文本类别的 state/transition 证据尺度和 rank-scale。
 - 每个异常文本在冻结 CLIP final visual space 的显式方向校正、先验和语义 rank-scale；这条分支覆盖全部 768 个 final hidden 通道。
+- normal-video memory 的距离校准与保守融合尺度；正常视频原型本身完全冻结、来自 discovery 阶段的真实正常帧。
 
 其中 state 是 hidden 相对**最近的真实正常原型**的有符号偏离，transition 是相对正常 context 的局部变化惊异度；两者都是逐帧、逐 `layer-dimension-text` 可分解的线性证据。原型检索避免把同一场景中的不同正常姿态、镜头或运动模式粗暴压成一个均值。读出器以数据集原始视频类别训练一个没有隐藏 MLP 的 direct hidden MIL probe；它只含每个文本的温度/先验，迫使通道电路自身能够区分类别，而不是只学会跟随 baseline 概率。对类别 `c` 的最终融合是：
 
@@ -76,6 +79,7 @@ softmax 后的类别概率与异常分数（排序/定位）
 semantic_anomaly = 1 - product_c [1 - semantic_probability(c)]
 logit p_final(anomaly) = logit p_frozen(anomaly)
                        + semantic_binary_scale × logit semantic_anomaly
+                       + memory_binary_scale × logit normal_memory_anomaly
 p_final(class c | anomaly) = p_frozen(class c | anomaly)
 ```
 
@@ -120,6 +124,7 @@ python -m ctnc_vad.discover \
   --context-iters 50 \
   --normal-prototype-count 64 \
   --prototype-frames-per-video 32 \
+  --normal-video-neighbor-count 8 \
   --frames-per-video 128 \
   --tail-fraction 0.125 \
   --semantic-weight 0.5 \
@@ -163,6 +168,43 @@ python -m ctnc_vad.train \
   --clean
 ```
 
+如果 discovery 从旧版本升级到包含 normal-video memory 的版本，可以复用旧 reader 的**兼容参数**，但要使用一个新的输出根目录，避免 `--clean` 删除初始化 checkpoint。例如下面只初始化旧的语义/稀疏 reader；新的正常视频记忆、优化器和 history 都从头开始：
+
+```bash
+python -m ctnc_vad.train \
+  --dataset xd \
+  --source-train-csv ../vad_data/work_xd/xd_train_local.csv \
+  --source-test-csv ../vad_data/work_xd/xd_test_local.csv \
+  --source-path-base . \
+  --train-hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_train_8gpu/manifest.csv \
+  --test-hidden-manifest ../vad_data/work_xd/clip_hidden_stride16_test_8gpu/manifest.csv \
+  --hidden-path-base . \
+  --assets ../vadclipDNA_data/xd_ctnc_vad/discovery/circuit_assets.pt \
+  --init-baseline-model ../vadclip_data/model/vadclip_xd.pth \
+  --init-verifier ../vadclipDNA_data/xd_ctnc_vad/training/model_best.pth \
+  --output-root ../vadclipDNA_data/xd_ctnc_memory_vad \
+  --gt-path VadCLIP/list/gt.npy \
+  --gt-segment-path VadCLIP/list/gt_segment.npy \
+  --gt-label-path VadCLIP/list/gt_label.npy \
+  --max-epoch 10 \
+  --batch-size 96 \
+  --lr 0.001 \
+  --semantic-lr 0.01 \
+  --scheduler-milestones 6 9 \
+  --normal-frame-weight 0.25 \
+  --preserve-weight 0.01 \
+  --sparsity-weight 0.001 \
+  --semantic-anchor-weight 0.05 \
+  --hidden-mil-weight 1.0 \
+  --verification-initial-logit -3.0 \
+  --alignment crop_hidden \
+  --seed 234 \
+  --device cuda \
+  --clean
+```
+
+这个初始化不是恢复训练：若进程中断，请对新输出根目录使用 `--resume`，不要同时再传 `--init-verifier`。
+
 每 epoch 会同时打印冻结 baseline 的官方 `AP2` 与 CTNC 后的 `AP2`，并分别打印稀疏正常性电路和全通道语义电路的 hidden-only AP。两者的联合分数不能代替单分支 AP：若某一分支在正常帧有系统性误报，应在后续局部重排中抑制它，而不是用“取最大值”掩盖问题。XD 当前正确的基线对齐值应为约 `0.845045`；这是保护评测序列顺序后的结果。最优 checkpoint 只按同一验证集上的官方 `AP2` 保存。
 
 测试最优 checkpoint：
@@ -202,7 +244,7 @@ python -m ctnc_vad.audit \
   --device cuda
 ```
 
-`audit/xd_test/circuit_dimensions.csv` 是稀疏通道字典；每个视频 `.npz` 还包含每帧的 `semantic_probability`，以及 `top_semantic_hidden_index_by_class` / `top_semantic_hidden_contribution_by_class`：它们直接给出全 final hidden 通道中支持各异常文本的维度及数值。`evaluation/predictions/*.npz` 会分别保存联合 `evidence`、`sparse_evidence` 和 `semantic_evidence`，用于检查是哪一条可解释证据真正改善了定位。
+`audit/xd_test/circuit_dimensions.csv` 是稀疏通道字典；每个视频 `.npz` 还包含每帧的 `semantic_probability`，以及 `top_semantic_hidden_index_by_class` / `top_semantic_hidden_contribution_by_class`：它们直接给出全 final hidden 通道中支持各异常文本的维度及数值。`normal_memory_nearest_video_index`、`normal_memory_nearest_prototype_index` 和 `normal_memory_distance` 给出真实正常反事实。`evaluation/predictions/*.npz` 会分别保存联合、稀疏、语义和 normal-memory evidence，用于检查是哪一条可解释证据真正改善了定位。
 
 ## 评测公平性与开销
 

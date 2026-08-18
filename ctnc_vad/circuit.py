@@ -30,7 +30,9 @@ def inverse_softplus(value: float) -> float:
     return math.log(math.expm1(value))
 
 
-def load_verifier_state(model: "ChannelRankVerifier", state: dict[str, torch.Tensor]) -> None:
+def load_verifier_state(
+    model: "ChannelRankVerifier", state: dict[str, torch.Tensor], *, reader_only: bool = False
+) -> None:
     """Load a verifier checkpoint, including the one safe fusion migration.
 
     The move from class-wise semantic addition to a binary semantic odds
@@ -38,9 +40,33 @@ def load_verifier_state(model: "ChannelRankVerifier", state: dict[str, torch.Ten
     weights remain compatible, so retaining them makes comparisons fair and
     avoids retraining an already learned hidden/text circuit.
     """
+    # A normal-memory discovery artifact contains data buffers (contexts,
+    # prototypes, CLIP route), so warm-starting must never replace those
+    # buffers with an earlier experiment's artifact.  Evaluation and exact
+    # resume still use the full state by default.
+    parameter_names = set(dict(model.named_parameters()))
+    all_state_names = set(model.state_dict())
+    source_unexpected = set(state) - all_state_names
+    if reader_only:
+        state = {name: value for name, value in state.items() if name in parameter_names}
     missing, unexpected = model.load_state_dict(state, strict=False)
-    allowed_missing = {"semantic_binary_scale_logits"}
+    allowed_missing = {
+        "semantic_binary_scale_logits",
+        "memory_temperature_logits",
+        "memory_bias",
+        "memory_binary_scale_logits",
+        # Version-5 normal-video memory is an immutable discovery asset, not
+        # a learned checkpoint value.  A version-4 reader can therefore seed
+        # the compatible semantic/circuit parameters of a version-5 reader;
+        # the newly discovered normal-video bank remains in the model.
+        "normal_video_signatures",
+        "normal_video_visual_prototypes",
+    }
     allowed_unexpected = {"semantic_rank_scale_logits"}
+    if reader_only:
+        allowed_missing |= all_state_names - parameter_names
+        # ``load_state_dict`` cannot report source entries filtered above.
+        unexpected = list(set(unexpected) | source_unexpected)
     if set(missing) - allowed_missing or set(unexpected) - allowed_unexpected:
         raise RuntimeError(
             "incompatible CTNC verifier checkpoint; "
@@ -89,6 +115,9 @@ class ChannelRankVerifier(nn.Module):
         self.register_buffer("transition_mean", assets["transition_mean"].float())
         self.register_buffer("transition_std", assets["transition_std"].float().clamp_min(1e-6))
         self.register_buffer("normal_prototypes", assets["normal_prototypes"].float())
+        self.register_buffer("normal_video_signatures", assets["normal_video_signatures"].float())
+        self.register_buffer("normal_video_visual_prototypes", assets["normal_video_visual_prototypes"].float())
+        self.normal_video_neighbor_count = int(assets["normal_video_neighbor_count"])
         self.register_buffer("selected_layers", assets["selected_layers"].long())
         self.register_buffer("selected_text_direction", assets["selected_text_direction"].float())
         self.register_buffer("selected_text_class", assets["selected_text_class"].long())
@@ -143,6 +172,12 @@ class ChannelRankVerifier(nn.Module):
         # class allocation; the hidden circuit answers only the question that
         # matters for localization: is this frame anomalous rather than normal?
         self.semantic_binary_scale_logits = nn.Parameter(torch.tensor(inverse_softplus(0.10)))
+        # Full-hidden normal-video memory calibration. It has no trainable
+        # encoder or prototype: only a readable distance-to-probability map
+        # and a conservative binary-odds scale.
+        self.memory_temperature_logits = nn.Parameter(torch.tensor(inverse_softplus(10.0)))
+        self.memory_bias = nn.Parameter(torch.tensor(-2.0))
+        self.memory_binary_scale_logits = nn.Parameter(torch.tensor(inverse_softplus(0.05)))
 
     def _context_indices(self, last_hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         signature = F.normalize(masked_mean(last_hidden, mask), dim=-1, eps=1e-6)
@@ -250,6 +285,39 @@ class ChannelRankVerifier(nn.Module):
             ),
         }
 
+    def _normal_video_memory(
+        self, last_hidden: torch.Tensor, visual: torch.Tensor, mask: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Compare each frame with matched real normal videos in frozen CLIP space."""
+        signature = F.normalize(masked_mean(last_hidden, mask), dim=-1, eps=1e-6)
+        video_similarity = signature @ self.normal_video_signatures.t()
+        neighbor_similarity, neighbor_video_index = video_similarity.topk(
+            self.normal_video_neighbor_count, dim=-1
+        )
+        # [B, neighbors, prototype_frames, 512]; all entries originated in
+        # training-set normal videos and are never optimized by this module.
+        candidate_visual = self.normal_video_visual_prototypes[neighbor_video_index]
+        frame_similarity = torch.einsum("btd,bkpd->btkp", visual, candidate_visual)
+        flattened_similarity = frame_similarity.flatten(start_dim=2)
+        nearest_similarity, nearest_flat_index = flattened_similarity.max(dim=-1)
+        prototype_count = candidate_visual.shape[2]
+        neighbor_slot = torch.div(nearest_flat_index, prototype_count, rounding_mode="floor")
+        prototype_index = nearest_flat_index.remainder(prototype_count)
+        nearest_video_index = torch.gather(neighbor_video_index, 1, neighbor_slot)
+        distance = (1.0 - nearest_similarity).clamp_min(0.0)
+        temperature = F.softplus(self.memory_temperature_logits)
+        probability = torch.sigmoid(temperature * distance + self.memory_bias)
+        return {
+            "normal_video_neighbor_similarity": neighbor_similarity,
+            "normal_video_neighbor_index": neighbor_video_index,
+            "normal_memory_nearest_similarity": nearest_similarity,
+            "normal_memory_nearest_video_index": nearest_video_index,
+            "normal_memory_nearest_prototype_index": prototype_index,
+            "normal_memory_distance": distance,
+            "normal_memory_probability": probability,
+            "normal_memory_temperature": temperature.reshape(1),
+        }
+
     def forward(
         self,
         circuit: torch.Tensor,
@@ -269,8 +337,10 @@ class ChannelRankVerifier(nn.Module):
         mask = times < lengths.unsqueeze(1)
         atoms = self._channel_state(circuit, last_hidden, mask)
         semantic = self._semantic_circuit(last_hidden)
+        memory = self._normal_video_memory(last_hidden, semantic["semantic_visual"], mask)
         rank_scales = F.softplus(self.rank_scale_logits)
         semantic_binary_scale = F.softplus(self.semantic_binary_scale_logits)
+        memory_binary_scale = F.softplus(self.memory_binary_scale_logits)
 
         # Do not let a weak sparse normality atom globally promote anomalous
         # frames.  Instead, fuse the reliable, all-channel semantic evidence
@@ -282,7 +352,12 @@ class ChannelRankVerifier(nn.Module):
         semantic_anomaly_clamped = semantic_anomaly_unmasked.clamp(1e-6, 1.0 - 1e-6)
         baseline_log_odds = torch.logit(baseline_anomaly)
         semantic_log_odds = torch.logit(semantic_anomaly_clamped)
-        verified = torch.sigmoid(baseline_log_odds + semantic_binary_scale * semantic_log_odds).masked_fill(~mask, 0.0)
+        memory_log_odds = torch.logit(memory["normal_memory_probability"].clamp(1e-6, 1.0 - 1e-6))
+        verified = torch.sigmoid(
+            baseline_log_odds
+            + semantic_binary_scale * semantic_log_odds
+            + memory_binary_scale * memory_log_odds
+        ).masked_fill(~mask, 0.0)
         conditional_class = baseline_probability[..., 1:] / baseline_anomaly.unsqueeze(-1)
         verified_all = torch.cat(
             ((1.0 - verified).unsqueeze(-1), verified.unsqueeze(-1) * conditional_class), dim=-1
@@ -300,6 +375,7 @@ class ChannelRankVerifier(nn.Module):
             1.0 - (1.0 - sparse_hidden_probability).prod(dim=-1)
         ).masked_fill(~mask, 0.0)
         hidden_probability = torch.maximum(sparse_hidden_probability, semantic["semantic_probability"])
+        hidden_probability = torch.maximum(hidden_probability, memory["normal_memory_probability"].unsqueeze(-1))
         hidden_anomaly = (1.0 - (1.0 - hidden_probability).prod(dim=-1)).masked_fill(~mask, 0.0)
         result = {
             "score": verified,
@@ -308,18 +384,21 @@ class ChannelRankVerifier(nn.Module):
             "mask": mask,
             "rank_scales": rank_scales,
             "semantic_binary_scale": semantic_binary_scale.reshape(1),
+            "memory_binary_scale": memory_binary_scale.reshape(1),
             "hidden_anomaly": hidden_anomaly,
             "hidden_probability": hidden_probability,
             "sparse_hidden_probability": sparse_hidden_probability,
             "sparse_hidden_anomaly": sparse_hidden_anomaly,
             "semantic_anomaly": semantic_anomaly.masked_fill(~mask, 0.0),
+            "normal_memory_anomaly": memory["normal_memory_probability"].masked_fill(~mask, 0.0),
             # Aliases keep the evaluator contract stable.
             "gates": atoms["state_gates"].mean(dim=1),
             "class_gates": atoms["state_gates"],
             "class_gains": rank_scales,
-            "verification_strength": semantic_binary_scale,
+            "verification_strength": semantic_binary_scale + memory_binary_scale,
             **atoms,
             **semantic,
+            **memory,
         }
         if return_channel_contribution:
             result["state_channel_contribution"] = (
@@ -371,6 +450,9 @@ def verifier_loss(
     # a meaningful, auditable contribution to frame ranking.
     semantic_pooled = mil_topk_mean(outputs["semantic_probability"], lengths)
     semantic_bag = F.binary_cross_entropy(semantic_pooled, class_targets)
+    video_anomaly = (class_targets.sum(dim=-1) > 0).to(outputs["score"].dtype)
+    memory_pooled = mil_topk_mean(outputs["normal_memory_anomaly"].unsqueeze(-1), lengths).squeeze(-1)
+    memory_bag = F.binary_cross_entropy(memory_pooled, video_anomaly)
     normal = class_targets.sum(dim=-1) < 0.5
     if bool(normal.any()):
         normal_score = outputs["score"][normal]
@@ -381,9 +463,15 @@ def verifier_loss(
         semantic_normal_loss = F.binary_cross_entropy(
             semantic_normal[semantic_mask], torch.zeros_like(semantic_normal[semantic_mask])
         )
+        memory_normal = outputs["normal_memory_anomaly"][normal]
+        memory_normal_mask = outputs["mask"][normal]
+        memory_normal_loss = F.binary_cross_entropy(
+            memory_normal[memory_normal_mask], torch.zeros_like(memory_normal[memory_normal_mask])
+        )
     else:
         normal_loss = torch.zeros((), device=class_targets.device)
         semantic_normal_loss = torch.zeros((), device=class_targets.device)
+        memory_normal_loss = torch.zeros((), device=class_targets.device)
     difference = (outputs["verified_all"] - outputs["baseline_probability"]).abs().mean(dim=-1)
     preserve = (difference * outputs["mask"].to(difference.dtype)).sum() / outputs["mask"].sum().clamp_min(1)
     sparse = 0.5 * (outputs["state_gates"].mean() + outputs["transition_gates"].mean())
@@ -395,8 +483,10 @@ def verifier_loss(
         bag
         + float(hidden_mil_weight) * hidden_bag
         + float(hidden_mil_weight) * semantic_bag
+        + float(hidden_mil_weight) * memory_bag
         + float(normal_weight) * normal_loss
         + float(normal_weight) * semantic_normal_loss
+        + float(normal_weight) * memory_normal_loss
         + float(preserve_weight) * preserve
         + float(sparsity_weight) * sparse
         + float(semantic_anchor_weight) * semantic_anchor
@@ -405,8 +495,10 @@ def verifier_loss(
         "bag": float(bag.detach()),
         "hidden_bag": float(hidden_bag.detach()),
         "semantic_bag": float(semantic_bag.detach()),
+        "memory_bag": float(memory_bag.detach()),
         "normal": float(normal_loss.detach()),
         "semantic_normal": float(semantic_normal_loss.detach()),
+        "memory_normal": float(memory_normal_loss.detach()),
         "preserve": float(preserve.detach()),
         "sparse": float(sparse.detach()),
         "semantic_anchor": float(semantic_anchor.detach()),
