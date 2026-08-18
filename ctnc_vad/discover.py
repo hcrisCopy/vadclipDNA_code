@@ -72,7 +72,11 @@ def load_clip_text_route(model_name: str, prompts: list[str], device: torch.devi
     model.eval()
     with torch.no_grad():
         tokens = clip.tokenize(prompts).to(device)
-        text = torch.nn.functional.normalize(model.encode_text(tokens).float(), dim=-1).cpu().numpy()
+        # VadCLIP's bundled CLIP fork exposes the prompt-tuning interface
+        # ``encode_text(text_embeddings, token_ids)`` rather than OpenAI
+        # CLIP's one-argument convenience method.
+        text_embeddings = model.encode_token(tokens)
+        text = torch.nn.functional.normalize(model.encode_text(text_embeddings, tokens).float(), dim=-1).cpu().numpy()
     visual = model.visual
     weight = visual.ln_post.weight.detach().float().cpu().numpy()
     bias = visual.ln_post.bias.detach().float().cpu().numpy()
