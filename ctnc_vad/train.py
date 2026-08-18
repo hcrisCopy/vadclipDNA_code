@@ -62,6 +62,10 @@ def main() -> None:
     parser.add_argument("--max-epoch", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument(
+        "--semantic-lr", type=float, default=None,
+        help="Learning rate only for the new all-channel text reader; defaults to 10x --lr because it starts from a frozen text direction.",
+    )
     parser.add_argument("--scheduler-milestones", type=int, nargs="+", default=None)
     parser.add_argument("--scheduler-rate", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -109,8 +113,9 @@ def main() -> None:
     args.batch_size = default_batch if args.batch_size is None else args.batch_size
     args.lr = default_lr if args.lr is None else args.lr
     args.scheduler_milestones = default_milestones if args.scheduler_milestones is None else args.scheduler_milestones
-    if args.batch_size <= 0 or args.lr <= 0:
-        parser.error("batch size and learning rate must be positive")
+    args.semantic_lr = (10.0 * args.lr) if args.semantic_lr is None else args.semantic_lr
+    if args.batch_size <= 0 or args.lr <= 0 or args.semantic_lr <= 0:
+        parser.error("batch size and learning rates must be positive")
 
     output_root = args.output_root or str(default_output_root(args.dataset))
     output = stage_dir(output_root, "training", clean=args.clean)
@@ -160,7 +165,20 @@ def main() -> None:
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda"
     )
     model = ChannelRankVerifier(assets, args.gate_initial_logit, args.verification_initial_logit).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # The full semantic reader begins exactly at frozen CLIP text directions.
+    # Its few correction/calibration parameters need to move faster than the
+    # sparse gates; this does not change VadCLIP or its optimizer at all.
+    semantic_parameters = [
+        model.semantic_correction,
+        model.semantic_bias,
+        model.semantic_rank_scale_logits,
+    ]
+    semantic_ids = {id(parameter) for parameter in semantic_parameters}
+    circuit_parameters = [parameter for parameter in model.parameters() if id(parameter) not in semantic_ids]
+    optimizer = torch.optim.AdamW([
+        {"params": circuit_parameters, "lr": args.lr},
+        {"params": semantic_parameters, "lr": args.semantic_lr},
+    ])
     scheduler = MultiStepLR(optimizer, args.scheduler_milestones, args.scheduler_rate)
     gt = np.load(args.gt_path)
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)

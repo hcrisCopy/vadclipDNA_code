@@ -150,6 +150,7 @@ python -m ctnc_vad.train \
   --max-epoch 10 \
   --batch-size 96 \
   --lr 0.001 \
+  --semantic-lr 0.01 \
   --scheduler-milestones 6 9 \
   --normal-frame-weight 0.25 \
   --preserve-weight 0.01 \
