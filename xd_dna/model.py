@@ -7,6 +7,28 @@ from torch import nn
 from .vadclip import build_baseline
 
 
+def _zero_invalid(sequence: torch.Tensor, lengths: torch.Tensor | None) -> torch.Tensor:
+    """Prevent a learned residual from entering padded temporal positions.
+
+    VadCLIP pads short sequences to ``visual_length`` before this wrapper is
+    called.  Its temporal encoder does not pass the padding mask into its
+    self-attention block, so leaving an MLP-generated residual at padded
+    positions can influence valid snippets.  Match DSANet-DNA's residual
+    contract by zeroing those positions immediately before the frozen
+    baseline consumes the enhanced 512D CLIP sequence.
+    """
+    if lengths is None:
+        return sequence
+    length_tensor = torch.as_tensor(lengths, device=sequence.device).reshape(-1)
+    if len(length_tensor) != sequence.shape[0]:
+        raise ValueError(
+            f"length batch size {len(length_tensor)} does not match feature batch size {sequence.shape[0]}"
+        )
+    positions = torch.arange(sequence.shape[1], device=sequence.device).unsqueeze(0)
+    valid = positions < length_tensor.unsqueeze(1)
+    return sequence * valid.unsqueeze(-1).to(sequence.dtype)
+
+
 class DNAResidualVadCLIP(nn.Module):
     """Map selected neurons to a zero-initialized residual over 512D CLIP input.
 
@@ -55,4 +77,5 @@ class DNAResidualVadCLIP(nn.Module):
         neurons, clip = visual[..., :self.neuron_width], visual[..., self.neuron_width:]
         correction = self.neuron_to_clip(self.neuron_norm(neurons))
         enhanced = clip + self.residual_gate.to(dtype=clip.dtype) * correction.to(dtype=clip.dtype)
+        enhanced = _zero_invalid(enhanced, lengths)
         return self.base(enhanced, padding_mask, text, lengths)
