@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from .assets import load_assets
 from .common import default_output_root, save_json, stage_dir, write_csv
+from .temporal import OPERATOR_NAMES
 
 
 def load_npz(path: Path) -> dict[str, np.ndarray]:
@@ -64,14 +65,15 @@ def make_figure(key: str, audit: dict[str, np.ndarray], assets: dict, topk: int,
     bar_axis = figure.add_subplot(grid[2, :])
     time = np.arange(len(fused))
     score_axis.plot(time, baseline, label="frozen baseline", color="#4c78a8", linewidth=1.7)
-    score_axis.plot(time, fused, label="CTSC classwise PoE", color="#e45756", linewidth=1.7)
+    score_axis.plot(time, fused, label="CTSC certified promotion", color="#e45756", linewidth=1.7)
     score_axis.plot(time, audit["circuit_class_probability"][:, class_index], label=f"{prompt} raw-channel circuit", color="#54a24b", linewidth=1.2)
+    score_axis.plot(time, audit["promotion"][:, class_index], label="certified promotion amount", color="#b279a2", linewidth=1.1, linestyle="--")
     score_axis.axvline(frame, color="#222", linestyle="--", linewidth=1, label="explained segment")
     score_axis.set_ylim(-0.03, 1.03)
     score_axis.set_xlim(0, max(1, len(fused) - 1))
     score_axis.set_xlabel("segment index")
     score_axis.set_ylabel("score")
-    score_axis.set_title("A. Frozen baseline and independently computed channel circuit")
+    score_axis.set_title("A. Frozen baseline and certified raw-channel promotion")
     score_axis.legend(ncol=4, fontsize=9)
     score_axis.grid(alpha=0.2)
     image = heat_axis.imshow(heat, aspect="auto", interpolation="nearest", cmap="magma")
@@ -94,13 +96,15 @@ def make_figure(key: str, audit: dict[str, np.ndarray], assets: dict, topk: int,
     map_axis.set_title("C. Which discovered raw channels the circuit actually retained")
     figure.colorbar(scatter, ax=map_axis, fraction=0.046, pad=0.04, label="learned direct class weight")
     frame_indices, frame_values = indices[frame], values[frame]
+    frame_operators = audit["top_channel_operator_index"][frame, class_index]
     order = np.argsort(frame_values)[::-1]
-    frame_indices, frame_values = frame_indices[order], frame_values[order]
+    frame_indices, frame_values, frame_operators = frame_indices[order], frame_values[order], frame_operators[order]
     bar_axis.barh(np.arange(len(frame_indices)), frame_values[::-1], color="#e45756")
     bar_axis.set_yticks(np.arange(len(frame_indices)))
-    bar_axis.set_yticklabels(labels(assets, frame_indices[::-1], class_index), fontsize=9)
-    bar_axis.set_xlabel("raw z-score along text direction × direct class weight")
-    bar_axis.set_title(f"D. Exact witnesses for {prompt} at segment {frame}")
+    bar_labels = labels(assets, frame_indices[::-1], class_index)
+    bar_axis.set_yticklabels([f"{label} · {OPERATOR_NAMES[int(operator)]}" for label, operator in zip(bar_labels, frame_operators[::-1])], fontsize=8)
+    bar_axis.set_xlabel("named temporal operator contribution from one raw CLIP channel")
+    bar_axis.set_title(f"D. Exact raw-channel temporal witnesses for {prompt} at segment {frame}")
     bar_axis.grid(axis="x", alpha=0.2)
     figure.suptitle(f"CTSC raw hidden-channel explanation · {key}", fontsize=15)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -148,9 +152,12 @@ def main() -> None:
         frame, class_index, selected = make_figure(key, audit, assets, args.topk, target)
         prompts, layers, dimensions, response = list(assets["prompts"]), assets["selected_layers"].cpu().numpy(), assets["selected_dimensions"].cpu().numpy(), assets["semantic_response"].cpu().numpy()
         index_at_frame, contribution_at_frame, zscore_at_frame = audit["top_channel_index"][frame, class_index], audit["top_channel_contribution"][frame, class_index], audit["top_channel_zscore"][frame, class_index]
+        operator_at_frame = audit["top_channel_operator_index"][frame, class_index]
+        operator_contribution_at_frame = audit["top_channel_operator_contribution"][frame, class_index]
+        operator_weight_at_frame = audit["top_channel_operator_weight"][frame, class_index]
         order = np.argsort(contribution_at_frame)[::-1]
-        write_csv(report, ["rank", "explained_anomaly_text", "circuit_index", "layer_1based", "dimension", "signed_text_response", "raw_zscore", "direct_weight", "contribution"], [[rank + 1, prompts[class_index + 1], int(index_at_frame[item]), int(layers[index_at_frame[item]]) + 1, int(dimensions[index_at_frame[item]]), float(response[index_at_frame[item], class_index]), float(zscore_at_frame[item]), float(audit["normalized_channel_weight"][index_at_frame[item], class_index]), float(contribution_at_frame[item])] for rank, item in enumerate(order)])
-        save_json(output / f"{key}_summary.json", {"video_key": key, "explained_segment_index": frame, "explained_anomaly_text": prompts[class_index + 1], "top_circuit_indices": [int(value) for value in selected], "baseline_score": float(audit["baseline"][frame]), "fused_score": float(audit["fused"][frame])})
+        write_csv(report, ["rank", "explained_anomaly_text", "circuit_index", "layer_1based", "dimension", "signed_text_response", "raw_zscore", "dominant_temporal_operator", "operator_direct_weight", "operator_contribution", "total_channel_contribution"], [[rank + 1, prompts[class_index + 1], int(index_at_frame[item]), int(layers[index_at_frame[item]]) + 1, int(dimensions[index_at_frame[item]]), float(response[index_at_frame[item], class_index]), float(zscore_at_frame[item]), OPERATOR_NAMES[int(operator_at_frame[item])], float(operator_weight_at_frame[item]), float(operator_contribution_at_frame[item]), float(contribution_at_frame[item])] for rank, item in enumerate(order)])
+        save_json(output / f"{key}_summary.json", {"video_key": key, "explained_segment_index": frame, "explained_anomaly_text": prompts[class_index + 1], "top_circuit_indices": [int(value) for value in selected], "baseline_score": float(audit["baseline"][frame]), "fused_score": float(audit["fused"][frame]), "certificate": float(audit["certificate"][frame, class_index]), "promotion": float(audit["promotion"][frame, class_index])})
         rows.append([key, target.name, report.name, "new"])
     write_csv(output / "index.csv", ["video_key", "figure", "top_channel_csv", "action"], rows)
     print(f"wrote {len(rows)} raw-channel explanation figures under {output}", flush=True)

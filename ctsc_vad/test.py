@@ -26,7 +26,7 @@ def model_state(path: str | Path) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate CTSC classwise PoE re-ranking with exact VadCLIP metrics.")
+    parser = argparse.ArgumentParser(description="Evaluate CTSC certified raw-channel promotion with exact VadCLIP metrics.")
     parser.add_argument("--dataset", choices=["xd", "ucf"], required=True)
     parser.add_argument("--source-test-csv", required=True)
     parser.add_argument("--source-path-base", default=".")
@@ -63,10 +63,10 @@ def main() -> None:
     predictions, _labels, rows = collect_predictions(model, dataset, baseline, options.visual_length, args.dataset, device, output / "predictions", not args.no_resume, "CTSC test")
     metrics = summarize(predictions, gt, gtsegments, gtlabels, args.dataset)
     write_prediction_index(output / "prediction_index.csv", rows)
-    save_json(output / "metrics.json", {**metrics, "dataset": args.dataset, "assets": args.assets, "model_path": args.model_path, "baseline_checkpoint": args.init_baseline_model, "method": "class-specific raw-channel circuit plus external product-of-experts re-ranking"})
+    save_json(output / "metrics.json", {**metrics, "dataset": args.dataset, "assets": args.assets, "model_path": args.model_path, "baseline_checkpoint": args.init_baseline_model, "method": "class-specific temporal raw-channel circuit plus external certified one-way promotion"})
     print_vadclip_metrics("[Frozen VadCLIP]", metrics["baseline"])
     print_vadclip_metrics("[CTSC circuit only]", metrics["channel_circuit_only"])
-    print_vadclip_metrics("[CTSC classwise PoE]", metrics["classwise_poe"])
+    print_vadclip_metrics("[CTSC certified promotion]", metrics["classwise_certified_promotion"])
 
 
 if __name__ == "__main__":

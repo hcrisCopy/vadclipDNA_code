@@ -56,9 +56,10 @@ def main() -> None:
     parser.add_argument("--normal-frame-weight", type=float, default=0.25)
     parser.add_argument("--preserve-weight", type=float, default=0.01)
     parser.add_argument("--channel-entropy-weight", type=float, default=0.01, help="Lower entropy selects a sparse, explainable raw channel circuit.")
-    parser.add_argument("--temporal-smoothness-weight", type=float, default=0.01)
+    parser.add_argument("--temporal-separation-weight", type=float, default=0.05, help="Encourage positive videos to concentrate evidence in a few temporal regions instead of smoothing it away.")
+    parser.add_argument("--temporal-separation-margin", type=float, default=0.20, help="Required top-versus-bottom raw-circuit probability gap for a positive video label.")
     parser.add_argument("--gate-initial-logit", type=float, default=-2.0)
-    parser.add_argument("--fusion-initial-logit", type=float, default=-2.0)
+    parser.add_argument("--fusion-initial-logit", type=float, default=-5.0, help="Start from an almost exact frozen baseline; promotion grows only when video labels support it.")
     parser.add_argument("--alignment", choices=["strict", "crop_hidden", "pad_hidden"], default="crop_hidden")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=234)
@@ -72,7 +73,7 @@ def main() -> None:
         raise ValueError("--clean and --resume cannot be combined")
     if args.max_epoch <= 0 or args.num_workers < 0 or not 0 < args.top_fraction <= 1 or args.scheduler_rate <= 0:
         parser.error("invalid epoch/worker/top-fraction/scheduler value")
-    if min(args.normal_frame_weight, args.preserve_weight, args.channel_entropy_weight, args.temporal_smoothness_weight) < 0:
+    if min(args.normal_frame_weight, args.preserve_weight, args.channel_entropy_weight, args.temporal_separation_weight) < 0 or args.temporal_separation_margin < 0:
         parser.error("loss weights must be non-negative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -117,11 +118,11 @@ def main() -> None:
         print(f"resume from epoch {start + 1}; best={best:.6f}", flush=True)
     for epoch in range(start, args.max_epoch):
         model.train()
-        totals, batches = {name: 0.0 for name in ("loss", "fused_bag", "circuit_bag", "normal", "preserve", "entropy", "temporal")}, 0
+        totals, batches = {name: 0.0 for name in ("loss", "fused_bag", "circuit_bag", "normal", "preserve", "entropy", "separation")}, 0
         progress = tqdm(loader, desc=f"CTSC train {epoch + 1}/{args.max_epoch}", unit="batch")
         for circuit, final_hidden, baseline_probability, lengths, targets in progress:
             output_values = model(circuit.to(device, non_blocking=True), final_hidden.to(device, non_blocking=True), baseline_probability.to(device, non_blocking=True), lengths.to(device, non_blocking=True))
-            loss, pieces = circuit_loss(output_values, targets.to(device, non_blocking=True), lengths.to(device, non_blocking=True), args.top_fraction, args.normal_frame_weight, args.preserve_weight, args.channel_entropy_weight, args.temporal_smoothness_weight)
+            loss, pieces = circuit_loss(output_values, targets.to(device, non_blocking=True), lengths.to(device, non_blocking=True), args.top_fraction, args.normal_frame_weight, args.preserve_weight, args.channel_entropy_weight, args.temporal_separation_weight, args.temporal_separation_margin)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -133,7 +134,7 @@ def main() -> None:
         scheduler.step()
         predictions, _labels, _rows = collect_predictions(model, test_set, baseline, options.visual_length, args.dataset, device, None, False, f"CTSC validate {epoch + 1}/{args.max_epoch}")
         validation = summarize(predictions, gt, gtsegments, gtlabels, args.dataset)
-        final = validation["classwise_poe"]
+        final = validation["classwise_certified_promotion"]
         selection = "ap2" if args.dataset == "xd" else "ap1"
         metric = float(final[selection])
         improved = metric > best

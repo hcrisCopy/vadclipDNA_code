@@ -1,65 +1,47 @@
-# CTSC-VAD：类别级稀疏 CLIP hidden 通道电路
+# CTSC-VAD：时序化的可解释 CLIP 通道电路
 
-CTSC-VAD 是一个**外挂模块**：VadCLIP 原封不动、权重完全冻结；CTSC 只读取已有 CLIP hidden states 和 VadCLIP 输出的类别概率。它不向 baseline 注入残差、不修改 encoder，也不用 baseline 分数制造正负样本。
+## 一句话
 
-## 先理解一句话
+VadCLIP 完全冻结。CTSC 不改它的权重、不注入残差，只读取已有 CLIP hidden states 中少数真实的 `(layer, dimension)`，用这些通道的**时间变化**去补充 VadCLIP 的排序和类别定位。
 
-旧方案是“所有异常类别共用一个 hidden 分数”。这会让 AP2 几乎不变、却扰乱每个类别的 mAP。
+旧 CTSC 的问题是：只看某一段的静态通道值，然后始终和 VadCLIP 做 PoE。实验已经证明这样会污染强 baseline。
 
-CTSC 改为：**每个异常类别都有自己的稀疏原始 hidden 通道电路。**例如 shooting 电路只读取朝 shooting 文本方向变化的 `(layer, dimension)`；fighting 电路则读取另一组通道。最后，电路和冻结 VadCLIP 在输出概率层做类别级专家融合。
-
-```text
-已有 CLIP hidden states [T, 12, 768]
-                 |
-正常场景下每个原始通道的 mean / std
-                 |
-沿每个异常文本方向的 raw z-score
-                 |
-每个类别的稀疏直接通道权重（可解释）
-                 |
-类别级时间证据 [T, C]
-                 +---------------------- 冻结 VadCLIP 概率 [T, C+1]
-                 |                                  |
-                 └──── 外挂 class-wise product-of-experts ────┘
-                                      |
-                              AP2 与每类 mAP 的新排序
-```
-
-## 为什么它可解释
-
-每一个最终贡献都能写成：
+新 CTSC 的原则是：
 
 ```text
-Layer 8, Dimension 312
-相对当前正常场景的 z-score：+2.1
-与 shooting 的冻结 CLIP 文本方向：正
-该类的直接通道权重：0.037
-本帧对 shooting 的贡献：0.078
+原始 CLIP hidden 通道 (Layer l, Dimension d)
+                     |
+正常场景的静态 + 动态参考
+                     |
+五种固定、可命名的时间证据
+  1. 朝异常文本方向的通道值
+  2. 朝异常文本方向的突变
+  3. 背异常文本方向的突变
+  4. 短期状态相对长期状态的偏离
+  5. 持续存在的文本方向通道值
+                     |
+每个类别稀疏选择少数「原始通道 × 时间证据」
+                     |
+证据必须高、类别明确、且邻近片段也支持
+                     |
+只提升该类别的 VadCLIP 排名；没有证据时完全保持 VadCLIP
 ```
 
-PCA/SVD 只帮助从 12×768 个原始坐标中保留候选；最终训练和推理从不使用“PCA 第几个主成分”。没有 MLP、adapter 或隐藏投影。
+因此一条解释可以直接写成：
 
-## 产物位置
+> `Layer 8, Dimension 312` 在第 57 段出现“朝 shooting 文本方向的突变”；它的直接权重和持续性证据共同满足证书，所以仅提升这一段的 shooting 排名。
 
-所有新产物都在同级相对目录：
+没有 MLP、adapter、attention 或隐藏投影。PCA/SVD 只用于从 12×768 个**原始坐标**中找候选，最终分类和解释从不读取 PCA 主成分。
 
-```text
-../vadclipDNA_data/xd_ctsc_vad/
-  discovery/        # 原始通道候选、正常场景 mean/std、文本方向
-  baseline_cache/   # 冻结 VadCLIP 训练概率，仅为输入缓存
-  training/         # 可继续训练的 checkpoint 和 history.csv
-  evaluation/       # 官方 VadCLIP 指标及逐视频预测
-  audit/            # 每帧、每类别的 Top 原始通道证据
-  visualization/    # PNG、Top 通道 CSV、摘要 JSON
-```
+## 必须重新发现通道
 
-## XD-Violence 正式运行
+本次资产版本从 v1 升级为 v2：增加了正常场景下每个原始通道的速度、短长期变化参考。旧的 `ctsc_assets.pt` 不能复用，这是故意的保护机制。
 
-以下命令在 `vadclipDNA_code` 根目录运行。所有路径都是相对路径。
+以下命令在 `vadclipDNA_code` 根目录运行，所有输出在同级相对目录 `../vadclipDNA_data/xd_ctsc_vad/`。
 
-### 1. 发现候选原始 hidden 通道和正常场景统计
+### 1. 发现原始通道和正常时序参考
 
-这一步不读 VadCLIP 输出，也不读异常标签。默认每层保留 128 个候选原始维度，共 1536 个；后续训练再按类别学习稀疏直接权重。
+只使用训练集中正常视频来建立参考；不读取 VadCLIP 分数，也不以 baseline 打分构造正负样本。
 
 ```bash
 python -m ctsc_vad.discover \
@@ -75,6 +57,9 @@ python -m ctsc_vad.discover \
   --global-subspace-rank 16 \
   --global-subspace-frames 4 \
   --semantic-frames-per-video 128 \
+  --temporal-short-window 5 \
+  --temporal-long-window 21 \
+  --temporal-persistence-window 5 \
   --std-floor 0.0001 \
   --ridge 0.001 \
   --seed 234 \
@@ -82,11 +67,11 @@ python -m ctsc_vad.discover \
   --clean
 ```
 
-重点查看 `discovery/selected_raw_channels.csv`：每一行都是一个真实 `layer + dimension`，以及它对应的冻结 CLIP 文本方向。
+重点看 `discovery/selected_raw_channels.csv`。每一行就是一个真实的 CLIP 层和维度，不是主成分。
 
-### 2. 训练类别级稀疏通道电路
+### 2. 训练外接时序通道电路
 
-VadCLIP 只在开始时被冻结并缓存一次训练概率，之后不会更新。视频标签只用于标准 weak-MIL；`--top-fraction` 选的是高证据的**时间片段**，不是先强行选几个通道。
+`--fusion-initial-logit -5.0` 很重要：开始时几乎等于原始 VadCLIP，只有独立通道电路学到可靠证据才会逐步提升某些片段。`--temporal-separation-*` 取代旧的平滑损失，防止异常证据被抹成整段视频都一样高。
 
 ```bash
 python -m ctsc_vad.train \
@@ -112,9 +97,10 @@ python -m ctsc_vad.train \
   --normal-frame-weight 0.25 \
   --preserve-weight 0.01 \
   --channel-entropy-weight 0.01 \
-  --temporal-smoothness-weight 0.01 \
+  --temporal-separation-weight 0.05 \
+  --temporal-separation-margin 0.20 \
   --gate-initial-logit -2.0 \
-  --fusion-initial-logit -2.0 \
+  --fusion-initial-logit -5.0 \
   --alignment crop_hidden \
   --num-workers 0 \
   --seed 234 \
@@ -122,13 +108,7 @@ python -m ctsc_vad.train \
   --clean
 ```
 
-训练中每个 epoch 会按 VadCLIP 同一 official test AP 规则保存 `training/model_best.pth`。日志同时打印：
-
-- baseline AP2 与 baseline dMAP；
-- **circuit alone** 的 AUC/AP/dMAP：先判断 hidden 电路本身有没有信息；
-- 最终 class-wise PoE 的 AP2 与 dMAP。
-
-中断后不要加 `--clean`，加 `--resume` 即可从 `checkpoint_last.pth` 继续。
+每个 epoch 都打印与 VadCLIP 一致的 baseline AP2/dMAP，以及 circuit-only 和最终 CTSC 的 AUC、AP、dMAP。最终仍按官方同一测试流程选择 best checkpoint；中断后去掉 `--clean`、加入 `--resume` 即可继续。
 
 ### 3. 测试最优模型
 
@@ -151,9 +131,9 @@ python -m ctsc_vad.test \
   --clean
 ```
 
-终端会完整打印两组 VadCLIP 原命名指标：`AUC1/AP1`、`AUC2/AP2`、每个 `mAP@...`、`average MAP`。第一组是冻结 VadCLIP，第二组是 CTSC；不要只看 AP2，也要看 mAP。
+终端会完整输出官方 VadCLIP 指标：`AUC1/AP1`、`AUC2/AP2`、每个类别的 `mAP@...` 和 `average MAP`。对比 `[Frozen VadCLIP]` 和 `[CTSC certified promotion]`。
 
-### 4. 导出逐通道解释
+### 4. 导出逐通道解释和论文图
 
 ```bash
 python -m ctsc_vad.audit \
@@ -171,13 +151,7 @@ python -m ctsc_vad.audit \
   --alignment crop_hidden \
   --device cuda \
   --clean
-```
 
-每个 `audit/xd_test/<video>.npz` 保存每帧、每个异常类别的 Top 原始通道索引、raw z-score、直接权重与贡献。它不是事后 attention。
-
-### 5. 画论文可用解释图
-
-```bash
 python -m ctsc_vad.visualize \
   --dataset xd \
   --assets ../vadclipDNA_data/xd_ctsc_vad/discovery/ctsc_assets.pt \
@@ -189,8 +163,8 @@ python -m ctsc_vad.visualize \
   --clean
 ```
 
-每个 PNG 有四部分：baseline 与最终重排、某异常类别的原始通道时间证据、候选通道被学习保留的情况、以及被解释帧的精确 Top 通道。相邻 `*_top_channels.csv` 可以直接用于论文案例表。
+每张图同时显示：冻结 baseline 与最终排序、通道电路分数、实际提升量、Top 原始通道热图和该帧的精确通道证据。相邻的 `*_top_channels.csv` 会写出层、维度、文本方向、主导时间算子、直接权重和贡献。
 
-## 开销
+## 额外开销
 
-默认 XD 为 `1536 通道 × 6 类 ≈ 9200` 个直接通道门控，外加少量类别尺度与融合系数。测试时不做 normal-prototype 最近邻检索，只做 context mean/std 的 raw z-score 和一个 `[T,1536] × [1536,6]` 的直接读出。已有 hidden states 可完全复用。
+已有 hidden states 不用重新提取。新增的是每个选中通道的固定窗口平均和直接读出：默认 `1536 通道 × 5 算子 × 6 类`，约 4.6 万个可训练的标量权重，没有 Transformer、图网络或额外 CLIP 前向。发现阶段多一次正常视频的时序统计；训练和测试阶段不检索样本库。

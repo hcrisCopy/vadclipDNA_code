@@ -18,7 +18,7 @@ def valid_prediction(path: Path, length: int) -> bool:
     try:
         value = np.load(path, allow_pickle=False)
         try:
-            names = {"prob1", "prob2", "prob2_all", "circuit", "circuit_all", "fused", "fused_all", "class_evidence", "context"}
+            names = {"prob1", "prob2", "prob2_all", "circuit", "circuit_all", "fused", "fused_all", "class_evidence", "class_operator_evidence", "certificate", "promotion", "context"}
             return names <= set(value.files) and all(len(value[name]) == length for name in ("prob1", "prob2", "prob2_all", "circuit", "circuit_all", "fused", "fused_all", "class_evidence"))
         finally:
             value.close()
@@ -33,8 +33,11 @@ def circuit_sequence(model, circuit: torch.Tensor, final_hidden: torch.Tensor, b
     detail = {
         "context": output["context"].cpu().numpy().astype(np.int64),
         "class_evidence": output["class_evidence"][0, :length].cpu().numpy().astype(np.float32),
+        "class_operator_evidence": output["class_operator_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "circuit_class_probability": output["class_probability"][0, :length].cpu().numpy().astype(np.float32),
         "circuit_all": output["circuit_distribution"][0, :length].cpu().numpy().astype(np.float32),
+        "certificate": output["certificate"][0, :length].cpu().numpy().astype(np.float32),
+        "promotion": output["promotion"][0, :length].cpu().numpy().astype(np.float32),
         "fusion_gamma": output["fusion_gamma"].cpu().numpy().astype(np.float32),
     }
     return output["score"][0, :length].cpu().numpy().astype(np.float32), output["fused_probability"][0, :length].cpu().numpy().astype(np.float32), detail
@@ -78,7 +81,7 @@ def summarize(predictions: dict[str, list[np.ndarray]], gt: np.ndarray, gtsegmen
     baseline = evaluate_vadclip(predictions["prob1"], predictions["prob2"], predictions["prob2_all"], gt, gtsegments, gtlabels, dataset)
     fused = evaluate_vadclip(predictions["fused"], predictions["fused"], predictions["fused_all"], gt, gtsegments, gtlabels, dataset)
     circuit = evaluate_vadclip(predictions["circuit"], predictions["circuit"], predictions["circuit_all"], gt, gtsegments, gtlabels, dataset)
-    return {"baseline": baseline.to_dict(), "channel_circuit_only": circuit.to_dict(), "classwise_poe": fused.to_dict()}
+    return {"baseline": baseline.to_dict(), "channel_circuit_only": circuit.to_dict(), "classwise_certified_promotion": fused.to_dict()}
 
 
 def write_prediction_index(path: Path, rows: list[list[object]]) -> None:

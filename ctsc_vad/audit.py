@@ -14,11 +14,25 @@ from .baseline import build_frozen_baseline, score_sequence
 from .circuit import SparseClassCircuit
 from .common import atomic_save_npz, default_output_root, hidden_manifest_paths, stage_dir, write_csv
 from .data import ChannelBagDataset
+from .temporal import OPERATOR_NAMES
 
 
 def model_state(path: str | Path) -> dict:
     value = torch.load(path, map_location="cpu", weights_only=False)
     return value["model_state_dict"] if isinstance(value, dict) and "model_state_dict" in value else value
+
+
+def valid_audit(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        value = np.load(path, allow_pickle=False)
+        try:
+            return {"top_channel_operator_index", "top_channel_operator_contribution", "certificate", "promotion"} <= set(value.files)
+        finally:
+            value.close()
+    except Exception:
+        return False
 
 
 @torch.no_grad()
@@ -29,6 +43,12 @@ def audit_video(model, item: dict, baseline, visual_length: int, dataset: str, d
     contribution = output["class_channel_contribution"][0, :length].permute(0, 2, 1)
     count = min(int(topk), contribution.shape[-1])
     top_value, top_index = contribution.topk(count, dim=-1)
+    operator_contribution = output["class_channel_operator_contribution"][0, :length].permute(0, 3, 1, 2)
+    selected_operator = torch.gather(operator_contribution, 2, top_index.unsqueeze(-1).expand(-1, -1, -1, operator_contribution.shape[-1]))
+    top_operator_value, top_operator_index = selected_operator.max(dim=-1)
+    operator_weight = output["normalized_channel_operator_weight"].permute(2, 0, 1).unsqueeze(0).expand(length, -1, -1, -1)
+    selected_operator_weight = torch.gather(operator_weight, 2, top_index.unsqueeze(-1).expand(-1, -1, -1, operator_weight.shape[-1]))
+    top_operator_weight = torch.gather(selected_operator_weight, -1, top_operator_index.unsqueeze(-1)).squeeze(-1)
     zscore = output["zscore"][0, :length]
     top_zscore = torch.gather(zscore.unsqueeze(1).expand(-1, contribution.shape[1], -1), 2, top_index)
     return {
@@ -37,14 +57,21 @@ def audit_video(model, item: dict, baseline, visual_length: int, dataset: str, d
         "fused": output["score"][0, :length].cpu().numpy().astype(np.float32),
         "fused_all": output["fused_probability"][0, :length].cpu().numpy().astype(np.float32),
         "class_evidence": output["class_evidence"][0, :length].cpu().numpy().astype(np.float32),
+        "class_operator_evidence": output["class_operator_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "circuit_class_probability": output["class_probability"][0, :length].cpu().numpy().astype(np.float32),
+        "certificate": output["certificate"][0, :length].cpu().numpy().astype(np.float32),
+        "promotion": output["promotion"][0, :length].cpu().numpy().astype(np.float32),
         "context": output["context"].cpu().numpy().astype(np.int64),
         "normalized_channel_weight": output["normalized_channel_weight"].cpu().numpy().astype(np.float32),
-        "raw_channel_weight": output["raw_channel_weight"].cpu().numpy().astype(np.float32),
+        "normalized_channel_operator_weight": output["normalized_channel_operator_weight"].cpu().numpy().astype(np.float32),
+        "raw_channel_weight": output["raw_channel_operator_weight"].sum(dim=1).cpu().numpy().astype(np.float32),
         "fusion_gamma": output["fusion_gamma"].cpu().numpy().astype(np.float32),
         "top_channel_index": top_index.cpu().numpy().astype(np.int64),
         "top_channel_contribution": top_value.cpu().numpy().astype(np.float32),
         "top_channel_zscore": top_zscore.cpu().numpy().astype(np.float32),
+        "top_channel_operator_index": top_operator_index.cpu().numpy().astype(np.int64),
+        "top_channel_operator_contribution": top_operator_value.cpu().numpy().astype(np.float32),
+        "top_channel_operator_weight": top_operator_weight.cpu().numpy().astype(np.float32),
     }
 
 
@@ -88,7 +115,7 @@ def main() -> None:
     rows: list[list[object]] = []
     for item in tqdm(dataset, desc=f"CTSC audit {args.split_name}", unit="video"):
         target = output / f"{item['key']}.npz"
-        if target.is_file() and not args.no_resume:
+        if valid_audit(target) and not args.no_resume:
             rows.append([item["key"], item["label"], item["length"], target.name, "reused"])
             continue
         evidence = audit_video(model, item, baseline, options.visual_length, args.dataset, device, args.topk)
@@ -101,6 +128,7 @@ def main() -> None:
     prompts = list(assets["prompts"])
     responses = assets["semantic_response"].cpu().numpy()
     write_csv(output / "circuit_channels.csv", ["circuit_index", "layer_1based", "dimension", "anomaly_text", "signed_text_response"], [[index, int(layer) + 1, int(dimension), prompts[class_index + 1], float(responses[index, class_index])] for index, (layer, dimension) in enumerate(zip(assets["selected_layers"].cpu().numpy(), assets["selected_dimensions"].cpu().numpy())) for class_index in range(len(prompts) - 1)])
+    write_csv(output / "temporal_operators.csv", ["operator_index", "operator_name"], list(enumerate(OPERATOR_NAMES)))
     print(f"wrote {len(rows)} resumable raw-channel audit artifacts under {output}", flush=True)
 
 
