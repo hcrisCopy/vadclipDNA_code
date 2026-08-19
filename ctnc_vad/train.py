@@ -63,7 +63,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument(
         "--reader-lr", type=float, default=None,
-        help="Learning rate for the selected-channel witness gates, thresholds and fusion scale; defaults to --lr.",
+        help="Learning rate for original-channel gates and channel/text/fusion scales; defaults to --lr.",
     )
     parser.add_argument("--scheduler-milestones", type=int, nargs="+", default=None)
     parser.add_argument("--scheduler-rate", type=float, default=0.1)

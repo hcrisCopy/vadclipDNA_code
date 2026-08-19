@@ -35,13 +35,13 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
         item["last_hidden"].unsqueeze(0).to(device),
         torch.full((1, length, class_count), 1.0 / class_count, dtype=torch.float32, device=device),
         torch.tensor([length], dtype=torch.int64, device=device),
-        return_channel_contribution=True,
     )
     contribution = outputs["channel_contribution"]
     count = min(int(topk), contribution.shape[-1])
     values, indices = contribution[0, :length].topk(count, dim=-1)
     return {
         "hidden_anomaly": outputs["hidden_anomaly"][0, :length].cpu().numpy().astype(np.float32),
+        "channel_anomaly": outputs["channel_anomaly"][0, :length].cpu().numpy().astype(np.float32),
         "channel_probability": outputs["channel_probability"][0, :length].cpu().numpy().astype(np.float32),
         "class_evidence": outputs["class_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "visual_score": outputs["visual_score"][0, :length].cpu().numpy().astype(np.float32),
@@ -52,7 +52,13 @@ def evidence_for_video(model: ChannelRankVerifier, item: dict, device: torch.dev
         "nearest_normal_gallery_index": outputs["nearest_normal_gallery_index"][0, :length].cpu().numpy().astype(np.int64),
         "nearest_normal_gallery": outputs["nearest_normal_gallery"][0, :length].cpu().numpy().astype(np.float32),
         "nearest_normal_similarity": outputs["nearest_normal_similarity"][0, :length].cpu().numpy().astype(np.float32),
+        "channel_delta": outputs["channel_delta"][0, :length].cpu().numpy().astype(np.float32),
         "channel_deviation": outputs["channel_deviation"][0, :length].cpu().numpy().astype(np.float32),
+        "channel_contribution": outputs["channel_contribution"][0, :length].cpu().numpy().astype(np.float32),
+        "channel_gates": outputs["channel_gates"].cpu().numpy().astype(np.float32),
+        "class_top_channel_index": outputs["class_top_channel_index"][0, :length].cpu().numpy().astype(np.int64),
+        "channel_evidence": outputs["channel_evidence"][0, :length].cpu().numpy().astype(np.float32),
+        "centered_channel_evidence": outputs["centered_channel_evidence"][0, :length].cpu().numpy().astype(np.float32),
         "normal_context": outputs["context"].cpu().numpy().astype(np.int64),
         "text_temperature": outputs["text_temperature"].cpu().numpy().astype(np.float32),
         "fusion_scale": outputs["fusion_scale"].cpu().numpy().astype(np.float32),

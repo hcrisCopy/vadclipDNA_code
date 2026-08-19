@@ -48,7 +48,10 @@ def verifier_sequence(
     )
     detail = {
         "context": outputs["context"].detach().cpu().numpy().astype(np.int64),
-        "hidden_anomaly": outputs["hidden_anomaly"][0, :length].detach().cpu().numpy().astype(np.float32),
+        # This is the calibrated channel-only witness score.  The final
+        # re-ranker can additionally use frozen CLIP text confirmation, but
+        # this saved series isolates what the selected raw channels explain.
+        "hidden_anomaly": outputs["channel_anomaly"][0, :length].detach().cpu().numpy().astype(np.float32),
         "class_evidence": outputs["class_evidence"][0, :length].detach().cpu().numpy().astype(np.float32),
         "fusion_scale": outputs["fusion_scale"].detach().cpu().numpy().astype(np.float32),
         "verification_strength": outputs["verification_strength"].reshape(1).detach().cpu().numpy().astype(np.float32),

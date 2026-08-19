@@ -13,6 +13,7 @@ from .circuit import ChannelRankVerifier, load_verifier_state
 from .common import default_output_root, hidden_manifest_paths, save_json, stage_dir
 from .dataset import HiddenBagDataset
 from .evaluate import collect_predictions, summarize_predictions, write_prediction_index
+from .metrics import print_vadclip_metrics
 
 
 def model_state(path: str | Path) -> dict:
@@ -81,14 +82,15 @@ def main() -> None:
         "assets": args.assets,
         "model_path": args.model_path,
         "baseline_checkpoint": args.init_baseline_model,
-        "verification": "hard-selected hidden-channel witness evidence re-ranks frozen baseline anomaly odds",
+        "verification": "text-conditioned original CLIP channel evidence locally re-ranks frozen baseline anomaly odds",
     })
-    final = metrics["rank_verified"]
+    # Keep the official VadCLIP metric names and every IoU mAP value visible.
+    # The two blocks make the frozen baseline / CTNC sidecar comparison explicit.
+    print_vadclip_metrics("[Frozen VadCLIP]", metrics["baseline"])
+    print_vadclip_metrics("[CTNC re-ranked]", metrics["rank_verified"])
     print(
-        f"baseline AUC2/AP2={metrics['baseline']['auc2']:.6f}/{metrics['baseline']['ap2']:.6f} | "
-        f"channel AUC/AP={metrics['channel_evidence_only']['auc']:.6f}/{metrics['channel_evidence_only']['ap']:.6f} | "
-        f"selected-channel AP={metrics['channel_evidence_only']['ap']:.6f} | "
-        f"verified AUC2/AP2={final['auc2']:.6f}/{final['ap2']:.6f} dMAP={final['detection_map_average']:.2f}%",
+        f"[CTNC evidence only] AUC: {metrics['channel_evidence_only']['auc']:.6f}  "
+        f"AP: {metrics['channel_evidence_only']['ap']:.6f}",
         flush=True,
     )
 

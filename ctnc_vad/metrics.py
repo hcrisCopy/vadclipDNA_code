@@ -84,3 +84,13 @@ def score_only_metrics(scores: list[np.ndarray], gt: np.ndarray) -> dict[str, fl
     if len(values) != len(gt):
         raise ValueError(f"frame ground-truth mismatch: predictions={len(values)}, gt={len(gt)}")
     return {"auc": float(roc_auc_score(gt, values)), "ap": float(average_precision_score(gt, values))}
+
+
+def print_vadclip_metrics(prefix: str, values: dict[str, object]) -> None:
+    """Print the same metric names and IoU breakdown as VadCLIP's test files."""
+    print(f"{prefix} AUC1: {float(values['auc1']):.6f}  AP1: {float(values['ap1']):.6f}", flush=True)
+    print(f"{prefix} AUC2: {float(values['auc2']):.6f}  AP2: {float(values['ap2']):.6f}", flush=True)
+    dmap = dict(values["detection_map_by_iou"])
+    for iou, score in dmap.items():
+        print(f"{prefix} mAP@{float(iou):.1f} ={float(score):.2f}%", flush=True)
+    print(f"{prefix} average MAP: {float(values['detection_map_average']):.2f}", flush=True)
